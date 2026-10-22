@@ -295,10 +295,10 @@ class $modify(PRPauseLayer, PauseLayer) {
             menu->addChild(btn);
             menu->updateLayout();
         } else {
-            auto menu = CCMenu::create();
-            menu->addChild(btn);
-            menu->setPosition({50.f, 50.f});
-            this->addChild(menu);
+            auto newMenu = CCMenu::create();
+            newMenu->addChild(btn);
+            newMenu->setPosition({50.f, 50.f});
+            this->addChild(newMenu);
         }
     }
 
