@@ -5,7 +5,7 @@
 	},
 	"id": "grupo.practice-runs",
 	"name": "Practice Runs",
-	"version": "v1.0.1",
+	"version": "v1.0.2",
 	"developer": "Grupo",
 	"description": "Practica tramos de un nivel (ej. 65-90) y musica normal en modo practica.",
 	"dependencies": {
