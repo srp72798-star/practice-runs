@@ -93,6 +93,57 @@ class $modify(PRStatsManager, GameStatsManager) {
 };
 
 // ------------------------------------------------------------
+// Velocidad correcta en un punto del nivel
+// ------------------------------------------------------------
+
+// Multiplicador de velocidad de cada portal (id del objeto)
+static float speedForPortal(int id) {
+    switch (id) {
+        case 200:  return 0.7f;   // lenta
+        case 201:  return 0.9f;   // normal
+        case 202:  return 1.1f;   // rapida
+        case 203:  return 1.3f;   // muy rapida
+        case 1334: return 1.6f;   // super rapida
+        default:   return -1.f;   // no es un portal de velocidad
+    }
+}
+
+static float speedForStart(Speed speed) {
+    switch (speed) {
+        case Speed::Slow:    return 0.7f;
+        case Speed::Fast:    return 1.1f;
+        case Speed::Faster:  return 1.3f;
+        case Speed::Fastest: return 1.6f;
+        default:             return 0.9f;
+    }
+}
+
+// Busca el ultimo portal de velocidad antes de la X del jugador
+static float correctSpeedAt(PlayLayer* pl, float x) {
+    float speed = pl->m_levelSettings ? speedForStart(pl->m_levelSettings->m_startSpeed) : 0.9f;
+    float bestX = -1e9f;
+    for (auto obj : CCArrayExt<GameObject*>(pl->m_objects)) {
+        float s = speedForPortal(obj->m_objectID);
+        if (s < 0.f) continue;
+        float ox = obj->getPositionX();
+        if (ox <= x && ox > bestX) {
+            bestX = ox;
+            speed = s;
+        }
+    }
+    return speed;
+}
+
+static void fixPlayerSpeed(PlayLayer* pl) {
+    float speed = correctSpeedAt(pl, pl->m_player1->getPositionX());
+    pl->m_player1->updateTimeMod(speed, true);
+    if (pl->m_player2 && pl->m_player2->isVisible()) {
+        pl->m_player2->updateTimeMod(speed, true);
+    }
+    log::info("Velocidad corregida a {}", speed);
+}
+
+// ------------------------------------------------------------
 // Capa para elegir la altura con el raton
 // ------------------------------------------------------------
 
@@ -151,6 +202,9 @@ protected:
         player->m_position = CCPoint(player->m_position.x, local.y);
         player->setPosition(player->m_position);
         player->m_yVelocity = 0.0;
+
+        // El avance rapido puede llegar con la velocidad equivocada
+        fixPlayerSpeed(pl);
 
         g_run.placingOwn = true;
         pl->markCheckpoint();
