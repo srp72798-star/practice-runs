@@ -12,6 +12,7 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
 #include <Geode/modify/GameStatsManager.hpp>
+#include <Geode/modify/PlayerObject.hpp>
 
 #include <cstdio>
 
@@ -34,6 +35,8 @@ struct RunData {
     float start = 0.f;
     float end = 100.f;
     bool frozen = false;
+    bool placingOwn = false;   // true mientras el mod pone su propio checkpoint
+    int syncFrames = 0;        // frames pendientes para resincronizar la musica
 };
 
 static RunData g_run;
@@ -42,10 +45,31 @@ static void setTimeScale(float scale) {
     CCDirector::get()->getScheduler()->setTimeScale(scale);
 }
 
+static bool allowRunCheckpoints() {
+    return Mod::get()->getSavedValue<bool>("allow-checkpoints", false);
+}
+
+// Se pueden poner checkpoints ahora?
+static bool checkpointsBlocked() {
+    if (g_run.placingOwn) return false;
+    switch (g_run.state) {
+        case RunState::Idle: return false;
+        case RunState::Running: return !allowRunCheckpoints();
+        default: return true;  // avance rapido, eligiendo altura, pregunta final
+    }
+}
+
+static void pauseMusic() {
+    FMODAudioEngine::get()->pauseAllMusic(true);
+}
+
 static void resetRun() {
     g_run.state = RunState::Idle;
     g_run.frozen = false;
+    g_run.placingOwn = false;
+    g_run.syncFrames = 0;
     setTimeScale(1.f);
+    FMODAudioEngine::get()->resumeAllMusic();
 }
 
 static bool parseRange(std::string const& text, float& a, float& b) {
@@ -128,7 +152,9 @@ protected:
         player->setPosition(player->m_position);
         player->m_yVelocity = 0.0;
 
+        g_run.placingOwn = true;
         pl->markCheckpoint();
+        g_run.placingOwn = false;
 
         g_run.frozen = false;
         g_run.state = RunState::Running;
@@ -160,6 +186,7 @@ static void beginPicking() {
     g_run.state = RunState::Picking;
     g_run.frozen = true;
     setTimeScale(1.f);
+    pauseMusic();
     PlatformToolbox::showCursor();
 
     if (auto picker = HeightPicker::create()) {
@@ -170,6 +197,7 @@ static void beginPicking() {
 static void showEndPrompt() {
     g_run.state = RunState::EndPrompt;
     g_run.frozen = true;
+    pauseMusic();
     PlatformToolbox::showCursor();
 
     createQuickPopup(
@@ -188,7 +216,7 @@ static void showEndPrompt() {
                 g_run.state = RunState::Running;
                 pl->resetLevel();  // vuelve al checkpoint del tramo
             } else {
-                g_run.state = RunState::Idle;
+                resetRun();
                 pl->removeAllCheckpoints();
                 pl->togglePracticeMode(false);
                 pl->resetLevelFromStart();
@@ -212,6 +240,7 @@ static void startRun() {
 
     auto speed = Mod::get()->getSettingValue<int64_t>("skip-speed");
     setTimeScale(static_cast<float>(speed));
+    pauseMusic();  // sin musica durante el avance rapido
 
     Notification::create(fmt::format("Avanzando hasta el {:g}%...", g_run.start))->show();
 }
@@ -226,7 +255,7 @@ protected:
     PauseLayer* m_pauseLayer = nullptr;
 
     bool init(PauseLayer* pauseLayer) {
-        if (!Popup::init(260.f, 160.f)) return false;
+        if (!Popup::init(280.f, 180.f)) return false;
         m_pauseLayer = pauseLayer;
 
         this->setTitle("Practicar un tramo");
@@ -238,16 +267,37 @@ protected:
         m_input = TextInput::create(160.f, "65-90");
         m_input->setFilter("0123456789-.");
         m_input->setMaxCharCount(11);
-        m_mainLayer->addChildAtPosition(m_input, Anchor::Center, {0.f, -2.f});
+        m_mainLayer->addChildAtPosition(m_input, Anchor::Center, {0.f, 4.f});
+
+        // Opcion: permitir checkpoints dentro del tramo
+        auto toggleMenu = CCMenu::create();
+        auto toggler = CCMenuItemToggler::createWithStandardSprites(
+            this, menu_selector(RunPopup::onToggleCheckpoints), 0.6f
+        );
+        toggler->toggle(allowRunCheckpoints());
+        toggler->setPosition({-80.f, 0.f});
+        toggleMenu->addChild(toggler);
+        auto toggleLabel = CCLabelBMFont::create("Permitir checkpoints en el tramo", "bigFont.fnt");
+        toggleLabel->setScale(0.3f);
+        toggleLabel->setAnchorPoint({0.f, 0.5f});
+        toggleLabel->setPosition({-64.f, 0.f});
+        toggleMenu->addChild(toggleLabel);
+        m_mainLayer->addChildAtPosition(toggleMenu, Anchor::Center, {0.f, -26.f});
 
         auto btn = CCMenuItemSpriteExtra::create(
             ButtonSprite::create("Empezar"), this, menu_selector(RunPopup::onStart)
         );
         auto menu = CCMenu::create();
         menu->addChild(btn);
-        m_mainLayer->addChildAtPosition(menu, Anchor::Bottom, {0.f, 28.f});
+        m_mainLayer->addChildAtPosition(menu, Anchor::Bottom, {0.f, 24.f});
 
         return true;
+    }
+
+    void onToggleCheckpoints(CCObject* sender) {
+        // El toggler cambia de estado despues del callback
+        auto toggler = static_cast<CCMenuItemToggler*>(sender);
+        Mod::get()->setSavedValue<bool>("allow-checkpoints", !toggler->isToggled());
     }
 
     void onStart(CCObject*) {
@@ -325,9 +375,46 @@ class $modify(PRBaseGameLayer, GJBaseGameLayer) {
 // Hooks del nivel
 // ------------------------------------------------------------
 
+// Bloquear checkpoints automaticos durante el tramo
+class $modify(PRPlayerObject, PlayerObject) {
+    void tryPlaceCheckpoint() {
+        if (checkpointsBlocked()) return;
+        PlayerObject::tryPlaceCheckpoint();
+    }
+};
+
 class $modify(PRPlayLayer, PlayLayer) {
+    // Todos los checkpoints (automaticos y manuales) pasan por aqui
+    void storeCheckpoint(CheckpointObject* checkpoint) {
+        if (checkpointsBlocked()) return;
+        PlayLayer::storeCheckpoint(checkpoint);
+    }
+
+    // Al reaparecer en un checkpoint durante el tramo, resincronizar musica
+    void loadFromCheckpoint(CheckpointObject* object) {
+        PlayLayer::loadFromCheckpoint(object);
+        if (g_run.state == RunState::Running) {
+            g_run.syncFrames = 2;  // esperar a que el juego termine el reinicio
+        }
+    }
+
+    void syncMusic() {
+        auto pos = m_player1->getPosition();
+        float seconds = this->timeForPos(pos, 0, 0, true, 0);
+        if (m_levelSettings) seconds += m_levelSettings->m_songOffset;
+        if (seconds < 0.f) seconds = 0.f;
+
+        auto engine = FMODAudioEngine::get();
+        engine->resumeAllMusic();
+        engine->setMusicTimeMS(static_cast<unsigned int>(seconds * 1000.f), true, 0);
+    }
+
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
+
+        if (g_run.syncFrames > 0 && --g_run.syncFrames == 0 && g_run.state == RunState::Running) {
+            this->syncMusic();
+        }
 
         if (g_run.state == RunState::Skipping) {
             float percent = this->getCurrentPercent();
