@@ -2,10 +2,12 @@
 //
 // 1) Musica normal en modo practica: desbloquea la opcion oficial
 //    "Practice Music Sync" (normalmente requiere el Music Unlocker).
-// 2) Tramos: desde el menu de pausa escribes "65-90". El juego avanza
-//    rapido (con noclip) hasta el 65%, se congela, eliges la altura del
-//    checkpoint con el raton y practicas hasta el 90%. Al llegar te pregunta
-//    si repetir el tramo o jugar el nivel normal.
+// 2) Tramos: desde el menu de pausa escribes "65-90". El mod te teletransporta
+//    al 65% con un StartPos invisible que lleva el modo, la velocidad, la
+//    gravedad, el tamano, el dual y el espejo correctos (mira los portales que
+//    hay antes). El juego carga los triggers hasta ese punto, asi que los
+//    objetos estan donde deben. Eliges la altura del checkpoint con el raton,
+//    practicas hasta el 90% y eliges si repetir o jugar el nivel normal.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -24,7 +26,6 @@ using namespace geode::prelude;
 
 enum class RunState {
     Idle,       // no hay tramo activo
-    Skipping,   // avanzando rapido hasta el inicio
     Picking,    // congelado, eligiendo altura con el raton
     Running,    // practicando el tramo
     EndPrompt   // llegado al final, esperando respuesta
@@ -40,10 +41,7 @@ struct RunData {
 };
 
 static RunData g_run;
-
-static void setTimeScale(float scale) {
-    CCDirector::get()->getScheduler()->setTimeScale(scale);
-}
+static Ref<StartPosObject> g_startPos = nullptr;  // StartPos invisible del tramo
 
 static bool allowRunCheckpoints() {
     return Mod::get()->getSavedValue<bool>("allow-checkpoints", false);
@@ -55,7 +53,7 @@ static bool checkpointsBlocked() {
     switch (g_run.state) {
         case RunState::Idle: return false;
         case RunState::Running: return !allowRunCheckpoints();
-        default: return true;  // avance rapido, eligiendo altura, pregunta final
+        default: return true;  // eligiendo altura o pregunta final
     }
 }
 
@@ -63,12 +61,16 @@ static void pauseMusic() {
     FMODAudioEngine::get()->pauseAllMusic(true);
 }
 
+static void clearStartPos(PlayLayer* pl) {
+    if (pl && g_startPos) pl->setStartPosObject(nullptr);
+    g_startPos = nullptr;
+}
+
 static void resetRun() {
     g_run.state = RunState::Idle;
     g_run.frozen = false;
     g_run.placingOwn = false;
     g_run.syncFrames = 0;
-    setTimeScale(1.f);
     FMODAudioEngine::get()->resumeAllMusic();
 }
 
@@ -93,22 +95,20 @@ class $modify(PRStatsManager, GameStatsManager) {
 };
 
 // ------------------------------------------------------------
-// Velocidad correcta en un punto del nivel
+// Estado del nivel en un punto: mira los portales anteriores
 // ------------------------------------------------------------
 
-// Multiplicador de velocidad de cada portal (id del objeto)
-static float speedForPortal(int id) {
-    switch (id) {
-        case 200:  return 0.7f;   // lenta
-        case 201:  return 0.9f;   // normal
-        case 202:  return 1.1f;   // rapida
-        case 203:  return 1.3f;   // muy rapida
-        case 1334: return 1.6f;   // super rapida
-        default:   return -1.f;   // no es un portal de velocidad
-    }
-}
+struct LevelStateAt {
+    int mode = 0;          // 0 cubo, 1 nave, 2 bola, 3 ufo, 4 wave, 5 robot, 6 arana, 7 swing
+    Speed speed = Speed::Normal;
+    float speedValue = 0.9f;
+    bool flipped = false;  // gravedad invertida
+    bool mini = false;
+    bool dual = false;
+    bool mirror = false;
+};
 
-static float speedForStart(Speed speed) {
+static float speedValueOf(Speed speed) {
     switch (speed) {
         case Speed::Slow:    return 0.7f;
         case Speed::Fast:    return 1.1f;
@@ -118,29 +118,139 @@ static float speedForStart(Speed speed) {
     }
 }
 
-// Busca el ultimo portal de velocidad antes de la X del jugador
-static float correctSpeedAt(PlayLayer* pl, float x) {
-    float speed = pl->m_levelSettings ? speedForStart(pl->m_levelSettings->m_startSpeed) : 0.9f;
-    float bestX = -1e9f;
+// Para cada tipo de portal guarda el ultimo (el de mayor X) antes del punto
+struct Latest {
+    float x = -1e9f;
+    int id = -1;
+    void consider(float ox, int oid) {
+        if (ox > x) { x = ox; id = oid; }
+    }
+};
+
+static LevelStateAt levelStateAt(PlayLayer* pl, float targetX) {
+    LevelStateAt st;
+    if (auto ls = pl->m_levelSettings) {
+        st.mode = ls->m_startMode;
+        st.speed = ls->m_startSpeed;
+        st.flipped = ls->m_isFlipped;
+        st.mini = ls->m_startMini;
+        st.dual = ls->m_startDual;
+        st.mirror = ls->m_mirrorMode;
+    }
+
+    Latest mode, speed, gravity, size, dual, mirror;
     for (auto obj : CCArrayExt<GameObject*>(pl->m_objects)) {
-        float s = speedForPortal(obj->m_objectID);
-        if (s < 0.f) continue;
         float ox = obj->getPositionX();
-        if (ox <= x && ox > bestX) {
-            bestX = ox;
-            speed = s;
+        if (ox > targetX) continue;
+        int id = obj->m_objectID;
+        switch (id) {
+            // Portales de modo
+            case 12: case 13: case 47: case 111: case 660: case 745: case 1331: case 1933:
+                mode.consider(ox, id); break;
+            // Portales de velocidad
+            case 200: case 201: case 202: case 203: case 1334:
+                speed.consider(ox, id); break;
+            // Gravedad: azul normal, amarillo invertida
+            case 10: case 11:
+                gravity.consider(ox, id); break;
+            // Tamano: normal / mini
+            case 99: case 101:
+                size.consider(ox, id); break;
+            // Dual on / off
+            case 286: case 287:
+                dual.consider(ox, id); break;
+            // Espejo on / off
+            case 45: case 46:
+                mirror.consider(ox, id); break;
+            default: break;
         }
     }
-    return speed;
+
+    switch (mode.id) {
+        case 12:   st.mode = 0; break;
+        case 13:   st.mode = 1; break;
+        case 47:   st.mode = 2; break;
+        case 111:  st.mode = 3; break;
+        case 660:  st.mode = 4; break;
+        case 745:  st.mode = 5; break;
+        case 1331: st.mode = 6; break;
+        case 1933: st.mode = 7; break;
+        default: break;
+    }
+    switch (speed.id) {
+        case 200:  st.speed = Speed::Slow; break;
+        case 201:  st.speed = Speed::Normal; break;
+        case 202:  st.speed = Speed::Fast; break;
+        case 203:  st.speed = Speed::Faster; break;
+        case 1334: st.speed = Speed::Fastest; break;
+        default: break;
+    }
+    if (gravity.id != -1) st.flipped = (gravity.id == 11);
+    if (size.id != -1)    st.mini = (size.id == 101);
+    if (dual.id != -1)    st.dual = (dual.id == 286);
+    if (mirror.id != -1)  st.mirror = (mirror.id == 45);
+
+    st.speedValue = speedValueOf(st.speed);
+    return st;
 }
 
-static void fixPlayerSpeed(PlayLayer* pl) {
-    float speed = correctSpeedAt(pl, pl->m_player1->getPositionX());
-    pl->m_player1->updateTimeMod(speed, true);
-    if (pl->m_player2 && pl->m_player2->isVisible()) {
-        pl->m_player2->updateTimeMod(speed, true);
+// Crea el StartPos invisible en el punto del tramo
+static StartPosObject* createRunStartPos(PlayLayer* pl, float targetX) {
+    auto st = levelStateAt(pl, targetX);
+
+    auto settings = LevelSettingsObject::create();
+    if (auto ls = pl->m_levelSettings) {
+        // Copiar los ajustes generales del nivel para que la fisica sea la misma
+        settings->m_level = ls->m_level;
+        settings->m_songOffset = ls->m_songOffset;
+        settings->m_fadeIn = ls->m_fadeIn;
+        settings->m_fadeOut = ls->m_fadeOut;
+        settings->m_backgroundIndex = ls->m_backgroundIndex;
+        settings->m_groundIndex = ls->m_groundIndex;
+        settings->m_middleGroundIndex = ls->m_middleGroundIndex;
+        settings->m_groundLineIndex = ls->m_groundLineIndex;
+        settings->m_fontIndex = ls->m_fontIndex;
+        settings->m_twoPlayerMode = ls->m_twoPlayerMode;
+        settings->m_platformerMode = ls->m_platformerMode;
+        settings->m_allowMultiRotation = ls->m_allowMultiRotation;
+        settings->m_enablePlayerSqueeze = ls->m_enablePlayerSqueeze;
+        settings->m_fixGravityBug = ls->m_fixGravityBug;
+        settings->m_fixNegativeScale = ls->m_fixNegativeScale;
+        settings->m_fixRobotJump = ls->m_fixRobotJump;
+        settings->m_dynamicLevelHeight = ls->m_dynamicLevelHeight;
+        settings->m_sortGroups = ls->m_sortGroups;
+        settings->m_fixRadiusCollision = ls->m_fixRadiusCollision;
+        settings->m_enable22Changes = ls->m_enable22Changes;
+        settings->m_allowStaticRotate = ls->m_allowStaticRotate;
+        settings->m_reverseSync = ls->m_reverseSync;
+        settings->m_decreaseBoostSlide = ls->m_decreaseBoostSlide;
+        settings->m_enableImpulseFix = ls->m_enableImpulseFix;
     }
-    log::info("Velocidad corregida a {}", speed);
+    settings->m_startMode = st.mode;
+    settings->m_startSpeed = st.speed;
+    settings->m_isFlipped = st.flipped;
+    settings->m_startMini = st.mini;
+    settings->m_startDual = st.dual;
+    settings->m_mirrorMode = st.mirror;
+    settings->m_startsWithStartPos = true;
+
+    auto sp = StartPosObject::create();
+    sp->setSettings(settings);
+    // 105 = altura normal de salida; la altura buena la eliges luego con el raton
+    sp->setPosition({targetX, 105.f});
+
+    log::info("Tramo en X={}: modo {}, velocidad {}, gravedad {}, mini {}, dual {}, espejo {}",
+        targetX, st.mode, st.speedValue, st.flipped, st.mini, st.dual, st.mirror);
+    return sp;
+}
+
+// Por si acaso: fija la velocidad del jugador a la que toca en su X
+static void fixPlayerSpeed(PlayLayer* pl) {
+    auto st = levelStateAt(pl, pl->m_player1->getPositionX());
+    pl->m_player1->updateTimeMod(st.speedValue, true);
+    if (pl->m_player2 && pl->m_player2->isVisible()) {
+        pl->m_player2->updateTimeMod(st.speedValue, true);
+    }
 }
 
 // ------------------------------------------------------------
@@ -203,7 +313,6 @@ protected:
         player->setPosition(player->m_position);
         player->m_yVelocity = 0.0;
 
-        // El avance rapido puede llegar con la velocidad equivocada
         fixPlayerSpeed(pl);
 
         g_run.placingOwn = true;
@@ -239,7 +348,6 @@ public:
 static void beginPicking() {
     g_run.state = RunState::Picking;
     g_run.frozen = true;
-    setTimeScale(1.f);
     pauseMusic();
     PlatformToolbox::showCursor();
 
@@ -264,6 +372,7 @@ static void showEndPrompt() {
             PlatformToolbox::hideCursor();
             if (!pl) {
                 resetRun();
+                g_startPos = nullptr;
                 return;
             }
             if (repeat) {
@@ -272,6 +381,7 @@ static void showEndPrompt() {
             } else {
                 resetRun();
                 pl->removeAllCheckpoints();
+                clearStartPos(pl);
                 pl->togglePracticeMode(false);
                 pl->resetLevelFromStart();
             }
@@ -288,15 +398,19 @@ static void startRun() {
     }
     pl->removeAllCheckpoints();
 
-    g_run.state = RunState::Skipping;
+    float targetX = pl->m_levelLength * g_run.start / 100.f;
+    g_startPos = createRunStartPos(pl, targetX);
+    pl->setStartPosObject(g_startPos);
+
+    // El juego carga el nivel desde el StartPos (triggers incluidos)
+    g_run.state = RunState::Picking;
     g_run.frozen = false;
     pl->resetLevelFromStart();
 
-    auto speed = Mod::get()->getSettingValue<int64_t>("skip-speed");
-    setTimeScale(static_cast<float>(speed));
-    pauseMusic();  // sin musica durante el avance rapido
-
-    Notification::create(fmt::format("Avanzando hasta el {:g}%...", g_run.start))->show();
+    // Congelar cuando el reinicio haya terminado
+    Loader::get()->queueInMainThread([] {
+        if (PlayLayer::get() && g_run.state == RunState::Picking) beginPicking();
+    });
 }
 
 // ------------------------------------------------------------
@@ -470,22 +584,9 @@ class $modify(PRPlayLayer, PlayLayer) {
             this->syncMusic();
         }
 
-        if (g_run.state == RunState::Skipping) {
-            float percent = this->getCurrentPercent();
-            // Frenar un poco antes para no pasarse del inicio
-            if (percent >= g_run.start - 2.f) setTimeScale(1.f);
-            if (percent >= g_run.start) beginPicking();
-        } else if (g_run.state == RunState::Running) {
-            if (this->getCurrentPercent() >= g_run.end) showEndPrompt();
+        if (g_run.state == RunState::Running && this->getCurrentPercent() >= g_run.end) {
+            showEndPrompt();
         }
-    }
-
-    // Noclip solo durante el avance rapido
-    void destroyPlayer(PlayerObject* player, GameObject* object) {
-        if (g_run.state == RunState::Skipping && object != m_anticheatSpike) {
-            return;
-        }
-        PlayLayer::destroyPlayer(player, object);
     }
 
     // No dejar abrir la pausa mientras eliges altura o respondes
@@ -500,12 +601,14 @@ class $modify(PRPlayLayer, PlayLayer) {
     void togglePracticeMode(bool practiceMode) {
         if (!practiceMode && g_run.state != RunState::Idle) {
             resetRun();
+            clearStartPos(this);
         }
         PlayLayer::togglePracticeMode(practiceMode);
     }
 
     void onQuit() {
         resetRun();
+        clearStartPos(this);
         PlatformToolbox::showCursor();
         PlayLayer::onQuit();
     }
