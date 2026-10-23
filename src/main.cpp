@@ -16,7 +16,11 @@
 #include <Geode/modify/GameStatsManager.hpp>
 #include <Geode/modify/PlayerObject.hpp>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <optional>
+#include <vector>
 
 using namespace geode::prelude;
 
@@ -244,6 +248,42 @@ static StartPosObject* createRunStartPos(PlayLayer* pl, float targetX) {
     return sp;
 }
 
+// Detecta a que altura va el camino del nivel cerca de una X: mira los
+// objetos jugables (bloques, pinchos, rampas, pads, orbes) que hay un poco
+// antes y por delante, y devuelve la mediana de sus alturas.
+// Se llama despues de cargar el nivel hasta ese punto, asi que los objetos
+// movidos por triggers ya estan en su sitio.
+static bool isGameplayObject(GameObject* obj) {
+    switch (obj->m_objectType) {
+        case GameObjectType::Solid:
+        case GameObjectType::Hazard:
+        case GameObjectType::Slope:
+        case GameObjectType::Breakable:
+        case GameObjectType::YellowJumpPad:
+        case GameObjectType::PinkJumpPad:
+        case GameObjectType::GravityPad:
+        case GameObjectType::YellowJumpRing:
+        case GameObjectType::PinkJumpRing:
+        case GameObjectType::GravityRing:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static std::optional<float> detectPathY(PlayLayer* pl, float x) {
+    std::vector<float> ys;
+    for (auto obj : CCArrayExt<GameObject*>(pl->m_objects)) {
+        float ox = obj->getPositionX();
+        if (ox < x - 60.f || ox > x + 300.f) continue;
+        if (!isGameplayObject(obj)) continue;
+        ys.push_back(obj->getPositionY());
+    }
+    if (ys.empty()) return std::nullopt;
+    std::sort(ys.begin(), ys.end());
+    return ys[ys.size() / 2];
+}
+
 // Por si acaso: fija la velocidad del jugador a la que toca en su X
 static void fixPlayerSpeed(PlayLayer* pl) {
     auto st = levelStateAt(pl, pl->m_player1->getPositionX());
@@ -402,14 +442,28 @@ static void startRun() {
     g_startPos = createRunStartPos(pl, targetX);
     pl->setStartPosObject(g_startPos);
 
-    // El juego carga el nivel desde el StartPos (triggers incluidos)
+    // 1a carga: el juego carga el nivel desde el StartPos (triggers incluidos)
     g_run.state = RunState::Picking;
     g_run.frozen = false;
     pl->resetLevelFromStart();
 
-    // Congelar cuando el reinicio haya terminado
-    Loader::get()->queueInMainThread([] {
-        if (PlayLayer::get() && g_run.state == RunState::Picking) beginPicking();
+    Loader::get()->queueInMainThread([targetX] {
+        auto pl = PlayLayer::get();
+        if (!pl || g_run.state != RunState::Picking || !g_startPos) return;
+
+        // Con los objetos ya en su sitio, buscar a que altura va el camino
+        auto pathY = detectPathY(pl, targetX);
+        if (pathY && std::abs(*pathY - g_startPos->getPositionY()) > 30.f) {
+            log::info("Camino detectado a Y={}, recolocando el StartPos", *pathY);
+            g_startPos->setPosition({targetX, *pathY});
+            pl->setStartPosObject(g_startPos);
+            pl->resetLevelFromStart();  // 2a carga, ya a la altura buena
+        }
+
+        // Congelar cuando el reinicio haya terminado
+        Loader::get()->queueInMainThread([] {
+            if (PlayLayer::get() && g_run.state == RunState::Picking) beginPicking();
+        });
     });
 }
 
