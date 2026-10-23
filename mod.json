@@ -5,7 +5,7 @@
 	},
 	"id": "grupo.practice-runs",
 	"name": "Practice Runs",
-	"version": "v1.0.2",
+	"version": "v1.1.0",
 	"developer": "Grupo",
 	"description": "Practica tramos de un nivel (ej. 65-90) y musica normal en modo practica.",
 	"dependencies": {
@@ -17,14 +17,6 @@
 			"name": "Musica normal en practica",
 			"description": "Desbloquea la opcion 'Practice Music Sync' del juego. Activala en Ajustes del menu de pausa.",
 			"default": true
-		},
-		"skip-speed": {
-			"type": "int",
-			"name": "Velocidad del avance rapido",
-			"description": "Lo rapido que va el juego mientras avanza hasta el inicio del tramo.",
-			"default": 8,
-			"min": 1,
-			"max": 20
 		}
 	}
 }
