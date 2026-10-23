@@ -198,6 +198,14 @@ static LevelStateAt levelStateAt(PlayLayer* pl, float targetX) {
     return st;
 }
 
+// Coloca el StartPos. Hay que poner las dos posiciones: la visible y la
+// "de inicio" interna, que es la que usa el juego para la camara de los
+// modos voladores (nave, ufo, wave, swing...).
+static void placeStartPos(StartPosObject* sp, CCPoint pos) {
+    sp->setPosition(pos);
+    sp->setStartPos(pos);
+}
+
 // Crea el StartPos invisible en el punto del tramo
 static StartPosObject* createRunStartPos(PlayLayer* pl, float targetX) {
     auto st = levelStateAt(pl, targetX);
@@ -241,7 +249,7 @@ static StartPosObject* createRunStartPos(PlayLayer* pl, float targetX) {
     auto sp = StartPosObject::create();
     sp->setSettings(settings);
     // 105 = altura normal de salida; la altura buena la eliges luego con el raton
-    sp->setPosition({targetX, 105.f});
+    placeStartPos(sp, {targetX, 105.f});
 
     log::info("Tramo en X={}: modo {}, velocidad {}, gravedad {}, mini {}, dual {}, espejo {}",
         targetX, st.mode, st.speedValue, st.flipped, st.mini, st.dual, st.mirror);
@@ -455,7 +463,7 @@ static void startRun() {
         auto pathY = detectPathY(pl, targetX);
         if (pathY && std::abs(*pathY - g_startPos->getPositionY()) > 30.f) {
             log::info("Camino detectado a Y={}, recolocando el StartPos", *pathY);
-            g_startPos->setPosition({targetX, *pathY});
+            placeStartPos(g_startPos, {targetX, *pathY});
             pl->setStartPosObject(g_startPos);
             pl->resetLevelFromStart();  // 2a carga, ya a la altura buena
         }
