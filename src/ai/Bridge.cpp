@@ -31,7 +31,7 @@ using namespace geode::prelude;
 
 namespace {
     constexpr int kMaxBatch = 1000;
-    constexpr char const* kBridgeVersion = "0.4.1";
+    constexpr char const* kBridgeVersion = "0.5.0";
 
     // ---------------- respuestas ----------------
 
@@ -145,7 +145,7 @@ namespace {
     // nivel). Las claves de triggers salen de los comentarios "property N"
     // de los bindings de Geode (EffectGameObject / GameObject); 7/8/9 (RGB del
     // trigger de color) se comprueban al releer el objeto del juego.
-    struct PropRule { char const* key; double min; double max; char kind; }; // kind: i=entero, f=decimal, b=bool
+    struct PropRule { char const* key; double min; double max; char kind; }; // kind: i=entero, f=decimal, b=bool, z=capa Z
     constexpr PropRule kPropRules[] = {
         {"7", 0, 255, 'i'}, {"8", 0, 255, 'i'}, {"9", 0, 255, 'i'},   // color del trigger de color
         {"10", 0, 600, 'f'},                                          // duracion
@@ -160,6 +160,21 @@ namespace {
         {"62", 0, 1, 'b'},                                            // spawn triggered
         {"85", 0.1, 20, 'f'},                                         // easing rate
         {"87", 0, 1, 'b'},                                            // multi trigger
+        // Fase 8 (decoracion). Claves de los comentarios "property N" de
+        // GameObject / EffectGameObject / ShaderGameObject en los bindings.
+        {"20", 0, 10000, 'i'},                                        // capa del editor
+        {"24", -5, 11, 'z'},                                          // capa Z (enum ZLayer)
+        {"25", -1000, 1000, 'i'},                                     // orden Z
+        {"45", 0, 60, 'f'}, {"46", 0, 60, 'f'}, {"47", 0, 60, 'f'},   // pulse: fade in / hold / fade out
+        {"48", 0, 1, 'i'},                                            // pulse: modo (0 color, 1 HSV)
+        {"52", 0, 1, 'i'},                                            // pulse: objetivo (0 canal, 1 grupo)
+        {"371", 0.1, 10, 'f'},                                        // zoom de camara
+        {"75", 0, 20, 'f'}, {"84", 0, 2, 'f'},                        // shake: fuerza / intervalo
+        {"175", -100, 100, 'f'}, {"176", -100, 100, 'f'}, {"177", -100, 100, 'f'}, // shader: speed / strength / time off
+        {"179", 0, 10000, 'f'}, {"180", -100000, 100000, 'f'}, {"189", -100000, 100000, 'f'}, // shader: wave width / target X / target Y
+        {"181", 0, 60, 'f'}, {"182", 0, 60, 'f'},                     // shader: fade in / fade out
+        {"183", 0, 10000, 'f'}, {"191", 0, 10000, 'f'},               // shader: inner / outer
+        {"184", 0, 1, 'b'}, {"188", 0, 1, 'b'}, {"190", 0, 1, 'b'},   // shader: invert / useX / useY
     };
 
     PropRule const* findPropRule(std::string const& key) {
@@ -203,6 +218,13 @@ namespace {
                     return fmt::format("La propiedad '{}' va de {} a {}", key, rule->min, rule->max);
                 }
                 if (rule->kind != 'f' && v != std::floor(v)) return fmt::format("La propiedad '{}' debe ser entera", key);
+                if (rule->kind == 'z') {
+                    // Valores del enum ZLayer: B5=-5 B4=-3 B3=-1 Default=0 B2=1 B1=3 T1=5 T2=7 T3=9 T4=11
+                    static constexpr int kZ[] = {-5, -3, -1, 0, 1, 3, 5, 7, 9, 11};
+                    if (std::find(std::begin(kZ), std::end(kZ), static_cast<int>(v)) == std::end(kZ)) {
+                        return std::string("Capa Z no valida (usa -5,-3,-1,0,1,3,5,7,9,11)");
+                    }
+                }
                 out.emplace_back(key, numberToString(v));
             }
         }
@@ -968,6 +990,53 @@ namespace {
         }));
     }
 
+    // ---------------- cancion ----------------
+
+    ai::Response toolSetLevelSong(matjson::Value const& body) {
+        auto editor = LevelEditorLayer::get();
+        if (!editor || !editor->m_level) return fail("not_in_editor", "Abre un nivel en el editor primero", 409);
+        auto custom = body["songID"].asInt();
+        auto official = body["officialTrack"].asInt();
+        if (!custom && !official) return fail("invalid_params", "Indica 'songID' (Newgrounds / biblioteca) u 'officialTrack'");
+        auto apply = [&](GJGameLevel* level) {
+            if (!level) return;
+            if (custom) { level->m_songID = static_cast<int>(custom.unwrap()); level->m_audioTrack = 0; }
+            else { level->m_songID = 0; level->m_audioTrack = static_cast<int>(official.unwrap()); }
+        };
+        if (custom && (custom.unwrap() < 1 || custom.unwrap() > 99999999)) return fail("invalid_params", "songID fuera de rango");
+        if (official && (official.unwrap() < 0 || official.unwrap() > 100)) return fail("invalid_params", "officialTrack fuera de rango");
+        int before = editor->m_level->m_songID;
+        apply(editor->m_level);
+        if (editor->m_levelSettings && editor->m_levelSettings->m_level != editor->m_level) apply(editor->m_levelSettings->m_level);
+        log::info("[AI] Cancion del nivel: songID {} -> {}, audioTrack {}", before, editor->m_level->m_songID, editor->m_level->m_audioTrack);
+        return reply(matjson::makeObject({
+            {"ok", true},
+            {"songID", editor->m_level->m_songID},
+            {"audioTrack", editor->m_level->m_audioTrack},
+            {"note", "Si la cancion no esta descargada, descargala desde los ajustes del nivel (boton de la nota musical). Se guarda al guardar el nivel."},
+        }));
+    }
+
+    // ---------------- vista del editor ----------------
+    // Centra la camara del editor en (x, y) con un zoom, para poder revisar
+    // con capturas de pantalla lo que se ha construido.
+    ai::Response toolSetEditorView(matjson::Value const& body) {
+        auto editor = LevelEditorLayer::get();
+        if (!editor || !editor->m_editorUI || !editor->m_objectLayer) return fail("not_in_editor", "Abre un nivel en el editor primero", 409);
+        double x = body["x"].asDouble().unwrapOr(0), y = body["y"].asDouble().unwrapOr(200);
+        double zoom = std::clamp(body["zoom"].asDouble().unwrapOr(0.6), 0.1, 4.0);
+        if (x < -1000 || x > 1000000 || y < -3000 || y > 30000) return fail("invalid_params", "x/y fuera de rango");
+        editor->m_editorUI->updateZoom(static_cast<float>(zoom));
+        auto win = CCDirector::sharedDirector()->getWinSize();
+        float scale = editor->m_objectLayer->getScale();
+        editor->m_objectLayer->setPosition({
+            static_cast<float>(win.width / 2 - x * scale),
+            static_cast<float>(win.height / 2 + 40 - y * scale),
+        });
+        editor->m_editorUI->updateSlider();
+        return reply(matjson::makeObject({{"ok", true}, {"x", x}, {"y", y}, {"zoom", scale}}));
+    }
+
     // ---------------- despacho ----------------
 
     ai::Response handle(std::string const& tool, std::string const& body, std::string const& key) {
@@ -1007,6 +1076,10 @@ namespace {
             res = onMainThread([params] { return toolGetObjectsInArea(params); });
         } else if (tool == "get_level_summary") {
             res = onMainThread(toolGetLevelSummary);
+        } else if (tool == "set_editor_view") {
+            res = onMainThread([params] { return toolSetEditorView(params); });
+        } else if (tool == "set_level_song") {
+            res = onMainThread([params] { return toolSetLevelSong(params); });
         } else if (tool == "save_level") {
             res = onMainThread([params] { return toolSaveLevel(params); });
         } else if (tool == "get_object_catalog") {
