@@ -18,13 +18,16 @@
 #include <future>
 #include <mutex>
 #include <random>
+#include <algorithm>
+#include <cctype>
 #include <unordered_map>
+#include <unordered_set>
 
 using namespace geode::prelude;
 
 namespace {
     constexpr int kMaxBatch = 1000;
-    constexpr char const* kBridgeVersion = "0.2.1";
+    constexpr char const* kBridgeVersion = "0.3.0";
 
     // ---------------- respuestas ----------------
 
@@ -195,7 +198,367 @@ namespace {
         return out;
     }
 
-    ai::Response toolAddObjectsBatch(matjson::Value const& body) {
+    // ---------------- historial de lotes (para undo_last_batch) ----------------
+    // Cada lote guarda que objetos creo (para quitarlos al deshacer) y el texto
+    // completo de los que quito (para volver a crearlos). Se usa el propio
+    // serializador del juego (getSaveString), asi no se pierde ninguna
+    // propiedad (grupos, colores, ajustes de triggers...).
+
+    struct HistoryEntry {
+        std::string batchId;
+        std::string type;                      // add / modify / delete
+        std::vector<Ref<GameObject>> created;  // quitar al deshacer
+        std::vector<std::string> removed;      // recrear al deshacer
+    };
+
+    LevelEditorLayer* g_historyEditor = nullptr;
+    std::vector<HistoryEntry> g_history;
+    constexpr size_t kMaxHistory = 50;
+
+    std::vector<HistoryEntry>& historyFor(LevelEditorLayer* editor) {
+        // Si se ha abierto otro nivel (u otra vez el editor), el historial
+        // anterior ya no vale
+        if (editor != g_historyEditor) {
+            g_history.clear();
+            g_historyEditor = editor;
+        }
+        return g_history;
+    }
+
+    void pushHistory(LevelEditorLayer* editor, HistoryEntry entry) {
+        auto& history = historyFor(editor);
+        history.push_back(std::move(entry));
+        if (history.size() > kMaxHistory) history.erase(history.begin());
+    }
+
+    std::string saveStringOf(GameObject* obj, LevelEditorLayer* editor) {
+        return std::string(obj->getSaveString(editor).c_str());
+    }
+
+    // Texto de objeto "k,v,k,v,..." <-> lista ordenada de pares
+    using KeyValues = std::vector<std::pair<std::string, std::string>>;
+
+    KeyValues splitObjectString(std::string const& str) {
+        KeyValues out;
+        size_t pos = 0;
+        while (pos < str.size()) {
+            auto comma1 = str.find(',', pos);
+            if (comma1 == std::string::npos) break;
+            auto comma2 = str.find(',', comma1 + 1);
+            auto value = str.substr(comma1 + 1, comma2 == std::string::npos ? std::string::npos : comma2 - comma1 - 1);
+            out.emplace_back(str.substr(pos, comma1 - pos), value);
+            if (comma2 == std::string::npos) break;
+            pos = comma2 + 1;
+        }
+        return out;
+    }
+
+    void setKey(KeyValues& kv, std::string const& key, std::string const& value) {
+        for (auto& [k, v] : kv) {
+            if (k == key) { v = value; return; }
+        }
+        kv.emplace_back(key, value);
+    }
+
+    void removeKey(KeyValues& kv, std::string const& key) {
+        std::erase_if(kv, [&](auto const& p) { return p.first == key; });
+    }
+
+    std::string joinObjectString(KeyValues const& kv) {
+        std::string out;
+        for (auto const& [k, v] : kv) {
+            if (!out.empty()) out += ",";
+            out += k + "," + v;
+        }
+        return out;
+    }
+
+    std::unordered_map<int, GameObject*> objectsByUid(LevelEditorLayer* editor) {
+        std::unordered_map<int, GameObject*> map;
+        for (auto obj : CCArrayExt<GameObject*>(editor->m_objects)) map[obj->m_uniqueID] = obj;
+        return map;
+    }
+
+    void deselectAll(LevelEditorLayer* editor) {
+        if (editor->m_editorUI) editor->m_editorUI->deselectAll();
+    }
+
+    matjson::Value describe(GameObject* obj) {
+        return matjson::makeObject({
+            {"uid", obj->m_uniqueID},
+            {"id", obj->m_objectID},
+            {"x", obj->getPositionX()},
+            {"y", obj->getPositionY()},
+            {"rotation", obj->getRotation()},
+            {"scale", obj->m_scaleX},
+            {"flipX", obj->m_isFlipX},
+            {"flipY", obj->m_isFlipY},
+        });
+    }
+
+    std::optional<std::vector<int>> parseUidList(matjson::Value const& value, std::string& error, size_t max) {
+        if (!value.isArray()) { error = "'uids' debe ser una lista de numeros"; return std::nullopt; }
+        auto const& items = value.asArray().unwrap();
+        if (items.empty()) { error = "'uids' esta vacia"; return std::nullopt; }
+        if (items.size() > max) { error = fmt::format("Maximo {} uids por lote", max); return std::nullopt; }
+        std::vector<int> uids;
+        for (auto const& item : items) {
+            auto v = item.asInt();
+            if (!v) { error = "'uids' solo puede tener numeros"; return std::nullopt; }
+            uids.push_back(static_cast<int>(v.unwrap()));
+        }
+        return uids;
+    }
+
+    ai::Response toolGetObjectCatalog(matjson::Value const& body) {
+        std::string query = body.contains("query") ? body["query"].asString().unwrapOr(std::string()) : "";
+        int limit = static_cast<int>(std::clamp<std::intmax_t>(body["limit"].asInt().unwrapOr(100), 1, 500));
+        int offset = static_cast<int>(std::max<std::intmax_t>(body["offset"].asInt().unwrapOr(0), 0));
+        for (auto& c : query) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+        auto items = matjson::Value::array();
+        int matched = 0;
+        for (auto const& [id, frame] : ObjectToolbox::sharedState()->m_allKeys) {
+            std::string name = frame.c_str();
+            std::string lower = name;
+            for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (!query.empty() && lower.find(query) == std::string::npos) continue;
+            if (matched >= offset && matched < offset + limit) {
+                items.push(matjson::makeObject({{"id", id}, {"frame", name}}));
+            }
+            matched++;
+        }
+        return reply(matjson::makeObject({
+            {"ok", true},
+            {"total", matched},
+            {"offset", offset},
+            {"items", items},
+        }));
+    }
+
+    ai::Response toolGetObjectsInArea(matjson::Value const& body) {
+        auto editor = LevelEditorLayer::get();
+        if (!editor) return fail("not_in_editor", "Abre un nivel en el editor primero", 409);
+        double x1 = body["x1"].asDouble().unwrapOr(-1e9), x2 = body["x2"].asDouble().unwrapOr(1e9);
+        double y1 = body["y1"].asDouble().unwrapOr(-1e9), y2 = body["y2"].asDouble().unwrapOr(1e9);
+        int limit = static_cast<int>(std::clamp<std::intmax_t>(body["limit"].asInt().unwrapOr(500), 1, 2000));
+        std::optional<int> idFilter;
+        if (body.contains("id")) idFilter = static_cast<int>(body["id"].asInt().unwrapOr(-1));
+
+        auto list = matjson::Value::array();
+        int matched = 0;
+        for (auto obj : CCArrayExt<GameObject*>(editor->m_objects)) {
+            float x = obj->getPositionX(), y = obj->getPositionY();
+            if (x < x1 || x > x2 || y < y1 || y > y2) continue;
+            if (idFilter && obj->m_objectID != *idFilter) continue;
+            if (matched < limit) list.push(describe(obj));
+            matched++;
+        }
+        return reply(matjson::makeObject({
+            {"ok", true},
+            {"total", matched},
+            {"truncated", matched > limit},
+            {"objects", list},
+        }));
+    }
+
+    ai::Response toolModifyObjectsBatch(matjson::Value const& body, std::string const& batchId) {
+        auto editor = LevelEditorLayer::get();
+        if (!editor) return fail("not_in_editor", "Abre un nivel en el editor primero", 409);
+        if (!body["changes"].isArray()) return fail("invalid_params", "'changes' debe ser una lista");
+        auto const& changes = body["changes"].asArray().unwrap();
+        if (changes.empty()) return fail("invalid_params", "'changes' esta vacia");
+        if (changes.size() > static_cast<size_t>(kMaxBatch)) return fail("invalid_params", fmt::format("Maximo {} cambios por lote", kMaxBatch));
+
+        auto byUid = objectsByUid(editor);
+
+        // 1) Validar TODO antes de tocar nada
+        struct Plan { GameObject* obj; std::string original; std::string modified; double x, y; };
+        std::vector<Plan> plans;
+        std::unordered_set<int> seen;
+        for (size_t i = 0; i < changes.size(); i++) {
+            auto const& c = changes[i];
+            auto uid = c["uid"].asInt();
+            if (!uid) return fail("invalid_params", fmt::format("changes[{}] necesita 'uid'", i));
+            int u = static_cast<int>(uid.unwrap());
+            if (!seen.insert(u).second) return fail("invalid_params", fmt::format("uid {} repetido", u));
+            auto it = byUid.find(u);
+            if (it == byUid.end()) return fail("not_found", fmt::format("No existe ningun objeto con uid {}", u), 404);
+            auto obj = it->second;
+
+            double x = obj->getPositionX(), y = obj->getPositionY();
+            if (c.contains("x")) x = c["x"].asDouble().unwrapOr(x);
+            if (c.contains("y")) y = c["y"].asDouble().unwrapOr(y);
+            x += c["dx"].asDouble().unwrapOr(0);
+            y += c["dy"].asDouble().unwrapOr(0);
+            if (x < -1000 || x > 1000000 || y < -3000 || y > 30000) {
+                return fail("invalid_params", fmt::format("changes[{}]: posicion fuera de rango", i));
+            }
+
+            auto original = saveStringOf(obj, editor);
+            auto kv = splitObjectString(original);
+            setKey(kv, "2", numberToString(x));
+            setKey(kv, "3", numberToString(y - kGroundOffsetY));
+            if (c.contains("rotation")) {
+                double r = c["rotation"].asDouble().unwrapOr(0);
+                if (r < -360 || r > 360) return fail("invalid_params", fmt::format("changes[{}]: rotation fuera de rango", i));
+                setKey(kv, "6", numberToString(r));
+            }
+            if (c.contains("scale")) {
+                double s = c["scale"].asDouble().unwrapOr(1);
+                if (s < 0.1 || s > 10) return fail("invalid_params", fmt::format("changes[{}]: scale fuera de rango", i));
+                removeKey(kv, "32");
+                setKey(kv, "128", numberToString(s));
+                setKey(kv, "129", numberToString(s));
+            }
+            if (c.contains("flipX")) setKey(kv, "4", c["flipX"].asBool().unwrapOr(false) ? "1" : "0");
+            if (c.contains("flipY")) setKey(kv, "5", c["flipY"].asBool().unwrapOr(false) ? "1" : "0");
+            plans.push_back({obj, original, joinObjectString(kv), x, y});
+        }
+
+        // 2) Aplicar: quitar el original y crear la version modificada
+        deselectAll(editor);
+        std::string newObjects;
+        HistoryEntry entry{batchId, "modify", {}, {}};
+        for (auto const& p : plans) {
+            entry.removed.push_back(p.original);
+            editor->removeObject(p.obj, true);
+            newObjects += p.modified + ";";
+        }
+        auto created = editor->createObjectsFromString(newObjects, true, true);
+        if (!created || created->count() != plans.size()) {
+            // Algo ha ido mal: devolver el nivel a como estaba
+            if (created) for (auto obj : CCArrayExt<GameObject*>(created)) editor->removeObject(obj, true);
+            std::string restore;
+            for (auto const& s : entry.removed) restore += s + ";";
+            editor->createObjectsFromString(restore, true, true);
+            return fail("modify_failed", "El juego no recreo todos los objetos; se ha restaurado el estado anterior", 500);
+        }
+
+        // 3) Verificar
+        auto list = matjson::Value::array();
+        int misplaced = 0;
+        size_t i = 0;
+        for (auto obj : CCArrayExt<GameObject*>(created)) {
+            entry.created.emplace_back(obj);
+            bool ok = std::abs(obj->getPositionX() - plans[i].x) < 0.5 && std::abs(obj->getPositionY() - plans[i].y) < 0.5;
+            if (!ok) misplaced++;
+            auto d = describe(obj);
+            d["oldUid"] = plans[i].obj->m_uniqueID;
+            d["positionOk"] = ok;
+            list.push(d);
+            i++;
+        }
+        pushHistory(editor, std::move(entry));
+        log::info("[AI] Modificados {} objetos (lote {})", plans.size(), batchId);
+
+        return reply(matjson::makeObject({
+            {"ok", misplaced == 0},
+            {"modified", static_cast<int>(plans.size())},
+            {"misplaced", misplaced},
+            {"note", "Los objetos modificados tienen uid nuevo (ver oldUid -> uid)"},
+            {"objects", list},
+        }));
+    }
+
+    ai::Response toolDeleteObjectsBatch(matjson::Value const& body, std::string const& batchId) {
+        auto editor = LevelEditorLayer::get();
+        if (!editor) return fail("not_in_editor", "Abre un nivel en el editor primero", 409);
+
+        std::vector<GameObject*> targets;
+        if (body.contains("uids")) {
+            std::string error;
+            auto uids = parseUidList(body["uids"], error, 2000);
+            if (!uids) return fail("invalid_params", error);
+            auto byUid = objectsByUid(editor);
+            for (int u : *uids) {
+                auto it = byUid.find(u);
+                if (it == byUid.end()) return fail("not_found", fmt::format("No existe ningun objeto con uid {}", u), 404);
+                targets.push_back(it->second);
+            }
+        } else if (body.contains("area")) {
+            auto const& a = body["area"];
+            auto x1 = a["x1"].asDouble(), x2 = a["x2"].asDouble(), y1 = a["y1"].asDouble(), y2 = a["y2"].asDouble();
+            if (!x1 || !x2 || !y1 || !y2) return fail("invalid_params", "'area' necesita x1, x2, y1 e y2");
+            for (auto obj : CCArrayExt<GameObject*>(editor->m_objects)) {
+                float x = obj->getPositionX(), y = obj->getPositionY();
+                if (x >= x1.unwrap() && x <= x2.unwrap() && y >= y1.unwrap() && y <= y2.unwrap()) targets.push_back(obj);
+            }
+        } else {
+            return fail("invalid_params", "Indica 'uids' o 'area'");
+        }
+
+        if (targets.empty()) return reply(matjson::makeObject({{"ok", true}, {"deleted", 0}}));
+        // Proteccion: borrados grandes necesitan confirmacion explicita
+        bool confirmed = body["confirm"].asBool().unwrapOr(false);
+        if (targets.size() > 200 && !confirmed) {
+            return fail("confirmation_required",
+                fmt::format("Esto borraria {} objetos. Repite con confirm=true si es correcto.", targets.size()), 409);
+        }
+        if (targets.size() > 5000) return fail("invalid_params", "Maximo 5000 objetos por borrado");
+
+        deselectAll(editor);
+        HistoryEntry entry{batchId, "delete", {}, {}};
+        for (auto obj : targets) {
+            entry.removed.push_back(saveStringOf(obj, editor));
+            editor->removeObject(obj, true);
+        }
+        int stillThere = 0;
+        for (auto obj : targets) if (editor->m_objects->containsObject(obj)) stillThere++;
+        int deleted = static_cast<int>(targets.size()) - stillThere;
+        pushHistory(editor, std::move(entry));
+        log::info("[AI] Borrados {} objetos (lote {})", deleted, batchId);
+
+        return reply(matjson::makeObject({
+            {"ok", stillThere == 0},
+            {"deleted", deleted},
+            {"objectCountAfter", static_cast<int>(editor->m_objects->count())},
+        }));
+    }
+
+    ai::Response toolUndoLastBatch() {
+        auto editor = LevelEditorLayer::get();
+        if (!editor) return fail("not_in_editor", "Abre un nivel en el editor primero", 409);
+        auto& history = historyFor(editor);
+        if (history.empty()) return fail("nothing_to_undo", "No hay ningun lote de la IA para deshacer en este nivel", 409);
+
+        auto entry = std::move(history.back());
+        history.pop_back();
+        deselectAll(editor);
+
+        // Quitar lo que creo el lote (si sigue en el nivel)
+        int removed = 0, missing = 0;
+        for (auto& obj : entry.created) {
+            if (editor->m_objects->containsObject(obj.data())) {
+                editor->removeObject(obj.data(), true);
+                removed++;
+            } else {
+                missing++;  // ya lo habia quitado alguien (p. ej. Ctrl+Z manual)
+            }
+        }
+        // Volver a crear lo que quito
+        int restored = 0;
+        if (!entry.removed.empty()) {
+            std::string restore;
+            for (auto const& s : entry.removed) restore += s + ";";
+            auto created = editor->createObjectsFromString(restore, true, true);
+            restored = created ? static_cast<int>(created->count()) : 0;
+        }
+        log::info("[AI] Deshecho lote {} ({}): quitados {}, restaurados {}", entry.batchId, entry.type, removed, restored);
+
+        return reply(matjson::makeObject({
+            {"ok", restored == static_cast<int>(entry.removed.size())},
+            {"undoneBatch", entry.batchId},
+            {"type", entry.type},
+            {"removed", removed},
+            {"alreadyMissing", missing},
+            {"restored", restored},
+            {"remainingInHistory", static_cast<int>(history.size())},
+            {"objectCountAfter", static_cast<int>(editor->m_objects->count())},
+        }));
+    }
+
+    ai::Response toolAddObjectsBatch(matjson::Value const& body, std::string const& batchId) {
         std::vector<ObjectSpec> specs;
         if (auto err = parseObjects(body["objects"], specs)) return fail("invalid_params", *err);
 
@@ -210,6 +573,11 @@ namespace {
 
         // Un solo paso de deshacer para todo el lote (Ctrl+Z del editor)
         editor->addToUndoList(UndoObject::createWithArray(created, UndoCommand::Paste), false);
+
+        // Y en el historial propio (undo_last_batch)
+        HistoryEntry entry{batchId, "add", {}, {}};
+        for (auto obj : CCArrayExt<GameObject*>(created)) entry.created.emplace_back(obj);
+        pushHistory(editor, std::move(entry));
 
         // Verificacion real: leer los objetos creados desde el juego y
         // comprobar que estan en el nivel y donde se pidieron
@@ -281,7 +649,17 @@ namespace {
         } else if (tool == "get_editor_state") {
             res = onMainThread(toolGetEditorState);
         } else if (tool == "add_objects_batch") {
-            res = onMainThread([params] { return toolAddObjectsBatch(params); });
+            res = onMainThread([params, key] { return toolAddObjectsBatch(params, key); });
+        } else if (tool == "modify_objects_batch") {
+            res = onMainThread([params, key] { return toolModifyObjectsBatch(params, key); });
+        } else if (tool == "delete_objects_batch") {
+            res = onMainThread([params, key] { return toolDeleteObjectsBatch(params, key); });
+        } else if (tool == "undo_last_batch") {
+            res = onMainThread(toolUndoLastBatch);
+        } else if (tool == "get_objects_in_area") {
+            res = onMainThread([params] { return toolGetObjectsInArea(params); });
+        } else if (tool == "get_object_catalog") {
+            res = onMainThread([params] { return toolGetObjectCatalog(params); });
         } else {
             return fail("unknown_tool", "Herramienta desconocida: " + tool, 404);
         }
