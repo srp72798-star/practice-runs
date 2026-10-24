@@ -15,6 +15,8 @@
 #include <Geode/modify/PauseLayer.hpp>
 #include <Geode/modify/GameStatsManager.hpp>
 #include <Geode/modify/PlayerObject.hpp>
+#include <Geode/modify/LevelTools.hpp>
+#include <Geode/modify/GameLevelManager.hpp>
 
 #include <algorithm>
 #include <climits>
@@ -98,6 +100,33 @@ class $modify(PRStatsManager, GameStatsManager) {
             return true;
         }
         return GameStatsManager::isItemUnlocked(type, id);
+    }
+};
+
+// ------------------------------------------------------------
+// Desbloquear los demons de RobTop sin monedas
+// (14 Clubstep, 18 Theory of Everything 2, 20 Deadlocked)
+// ------------------------------------------------------------
+
+static void unlockDemon(GJGameLevel* level) {
+    if (!level || !Mod::get()->getSettingValue<bool>("unlock-demons")) return;
+    int id = level->m_levelID.value();
+    if (id == 14 || id == 18 || id == 20) level->m_requiredCoins = 0;
+}
+
+class $modify(PRLevelTools, LevelTools) {
+    static GJGameLevel* getLevel(int id, bool noString) {
+        auto level = LevelTools::getLevel(id, noString);
+        unlockDemon(level);
+        return level;
+    }
+};
+
+class $modify(PRGameLevelManager, GameLevelManager) {
+    GJGameLevel* getMainLevel(int levelID, bool dontGetLevelString) {
+        auto level = GameLevelManager::getMainLevel(levelID, dontGetLevelString);
+        unlockDemon(level);
+        return level;
     }
 };
 
