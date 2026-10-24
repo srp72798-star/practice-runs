@@ -29,6 +29,10 @@ CPMAddPackage(
     DOWNLOAD_ONLY YES
 )
 target_include_directories(${PROJECT_NAME} PRIVATE ${httplib_SOURCE_DIR})
+# Server.cpp no usa Geode: sin la cabecera precompilada de Geode (trae
+# windows.h, que choca con winsock2.h de cpp-httplib)
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/ai/Server.cpp
+    PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 if (WIN32)
     target_link_libraries(${PROJECT_NAME} ws2_32)
 endif()
