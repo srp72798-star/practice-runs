@@ -27,7 +27,7 @@ using namespace geode::prelude;
 
 namespace {
     constexpr int kMaxBatch = 1000;
-    constexpr char const* kBridgeVersion = "0.3.0";
+    constexpr char const* kBridgeVersion = "0.3.1";
 
     // ---------------- respuestas ----------------
 
@@ -206,10 +206,24 @@ namespace {
 
     struct HistoryEntry {
         std::string batchId;
-        std::string type;                      // add / modify / delete
-        std::vector<Ref<GameObject>> created;  // quitar al deshacer
-        std::vector<std::string> removed;      // recrear al deshacer
+        std::string type;                          // add / modify / delete
+        std::vector<Ref<GameObject>> created;      // quitar al deshacer
+        std::vector<std::string> removed;          // recrear al deshacer
+        std::vector<Ref<GameObject>> removedRefs;  // los objetos que quito (mismo orden que removed)
     };
+
+    // Cuando el juego recrea un objeto (al modificar o al deshacer), el
+    // objeto nuevo es otro distinto con otro uid. Los lotes anteriores del
+    // historial tienen que apuntar al nuevo, o al deshacerlos no lo
+    // encontrarian (fallo visto en la prueba de la Fase 3).
+    void remapHistory(std::vector<HistoryEntry>& history, GameObject* from, GameObject* to) {
+        if (!from || from == to) return;
+        for (auto& entry : history) {
+            for (auto& ref : entry.created) {
+                if (ref.data() == from) ref = Ref<GameObject>(to);
+            }
+        }
+    }
 
     LevelEditorLayer* g_historyEditor = nullptr;
     std::vector<HistoryEntry> g_history;
@@ -419,9 +433,10 @@ namespace {
         // 2) Aplicar: quitar el original y crear la version modificada
         deselectAll(editor);
         std::string newObjects;
-        HistoryEntry entry{batchId, "modify", {}, {}};
+        HistoryEntry entry{batchId, "modify", {}, {}, {}};
         for (auto const& p : plans) {
             entry.removed.push_back(p.original);
+            entry.removedRefs.emplace_back(p.obj);
             editor->removeObject(p.obj, true);
             newObjects += p.modified + ";";
         }
@@ -435,12 +450,14 @@ namespace {
             return fail("modify_failed", "El juego no recreo todos los objetos; se ha restaurado el estado anterior", 500);
         }
 
-        // 3) Verificar
+        // 3) Verificar (y que los lotes anteriores apunten a los objetos nuevos)
+        auto& history = historyFor(editor);
         auto list = matjson::Value::array();
         int misplaced = 0;
         size_t i = 0;
         for (auto obj : CCArrayExt<GameObject*>(created)) {
             entry.created.emplace_back(obj);
+            remapHistory(history, plans[i].obj, obj);
             bool ok = std::abs(obj->getPositionX() - plans[i].x) < 0.5 && std::abs(obj->getPositionY() - plans[i].y) < 0.5;
             if (!ok) misplaced++;
             auto d = describe(obj);
@@ -489,18 +506,24 @@ namespace {
         }
 
         if (targets.empty()) return reply(matjson::makeObject({{"ok", true}, {"deleted", 0}}));
-        // Proteccion: borrados grandes necesitan confirmacion explicita
+        // Proteccion: los borrados grandes necesitan confirmacion explicita.
+        // "Grande" = mas de 100 objetos o mas de la cuarta parte del nivel
+        // (antes era solo >200 y la prueba borro un nivel entero de 21).
         bool confirmed = body["confirm"].asBool().unwrapOr(false);
-        if (targets.size() > 200 && !confirmed) {
+        size_t levelCount = editor->m_objects->count();
+        bool big = targets.size() > 100 || (levelCount >= 4 && targets.size() * 4 > levelCount);
+        if (big && !confirmed) {
             return fail("confirmation_required",
-                fmt::format("Esto borraria {} objetos. Repite con confirm=true si es correcto.", targets.size()), 409);
+                fmt::format("Esto borraria {} de los {} objetos del nivel. Pide permiso al usuario y repite con confirm=true.",
+                    targets.size(), levelCount), 409);
         }
         if (targets.size() > 5000) return fail("invalid_params", "Maximo 5000 objetos por borrado");
 
         deselectAll(editor);
-        HistoryEntry entry{batchId, "delete", {}, {}};
+        HistoryEntry entry{batchId, "delete", {}, {}, {}};
         for (auto obj : targets) {
             entry.removed.push_back(saveStringOf(obj, editor));
+            entry.removedRefs.emplace_back(obj);
             editor->removeObject(obj, true);
         }
         int stillThere = 0;
@@ -536,13 +559,26 @@ namespace {
                 missing++;  // ya lo habia quitado alguien (p. ej. Ctrl+Z manual)
             }
         }
-        // Volver a crear lo que quito
+        // Volver a crear lo que quito, y que los lotes anteriores apunten a
+        // los objetos restaurados (son objetos nuevos con otro uid)
         int restored = 0;
         if (!entry.removed.empty()) {
             std::string restore;
             for (auto const& s : entry.removed) restore += s + ";";
             auto created = editor->createObjectsFromString(restore, true, true);
             restored = created ? static_cast<int>(created->count()) : 0;
+            if (created && created->count() == entry.removed.size()) {
+                size_t i = 0;
+                for (auto obj : CCArrayExt<GameObject*>(created)) {
+                    if (i < entry.removedRefs.size()) remapHistory(history, entry.removedRefs[i].data(), obj);
+                    // En una modificacion, los lotes anteriores apuntaban a la
+                    // version modificada (created[i]); ahora vuelve el original
+                    if (entry.type == "modify" && i < entry.created.size()) {
+                        remapHistory(history, entry.created[i].data(), obj);
+                    }
+                    i++;
+                }
+            }
         }
         log::info("[AI] Deshecho lote {} ({}): quitados {}, restaurados {}", entry.batchId, entry.type, removed, restored);
 
@@ -575,7 +611,7 @@ namespace {
         editor->addToUndoList(UndoObject::createWithArray(created, UndoCommand::Paste), false);
 
         // Y en el historial propio (undo_last_batch)
-        HistoryEntry entry{batchId, "add", {}, {}};
+        HistoryEntry entry{batchId, "add", {}, {}, {}};
         for (auto obj : CCArrayExt<GameObject*>(created)) entry.created.emplace_back(obj);
         pushHistory(editor, std::move(entry));
 
