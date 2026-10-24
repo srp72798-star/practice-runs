@@ -110,6 +110,9 @@ struct LevelStateAt {
     bool mini = false;
     bool dual = false;
     bool mirror = false;
+    float timeWarp = 1.f;      // trigger Time Warp activo (1 = normal)
+    float speedPortalX = 0.f;  // para el registro
+    int speedPortalId = -1;
 };
 
 static float speedValueOf(Speed speed) {
@@ -142,12 +145,23 @@ static LevelStateAt levelStateAt(PlayLayer* pl, float targetX) {
         st.mirror = ls->m_mirrorMode;
     }
 
-    Latest mode, speed, gravity, size, dual, mirror;
+    Latest mode, speed, gravity, size, dual, mirror, warp;
+    float warpValue = 1.f;
     for (auto obj : CCArrayExt<GameObject*>(pl->m_objects)) {
         float ox = obj->getPositionX();
         if (ox > targetX) continue;
         int id = obj->m_objectID;
         switch (id) {
+            // Trigger Time Warp (solo los que se activan al pasar por su X)
+            case 1935: {
+                auto eff = static_cast<EffectGameObject*>(obj);
+                if (eff->m_isTouchTriggered || eff->m_isSpawnTriggered) break;
+                if (ox > warp.x) {
+                    warp.consider(ox, id);
+                    warpValue = eff->m_timeWarpTimeMod;
+                }
+                break;
+            }
             // Portales de modo
             case 12: case 13: case 47: case 111: case 660: case 745: case 1331: case 1933:
                 mode.consider(ox, id); break;
@@ -195,6 +209,9 @@ static LevelStateAt levelStateAt(PlayLayer* pl, float targetX) {
     if (mirror.id != -1)  st.mirror = (mirror.id == 45);
 
     st.speedValue = speedValueOf(st.speed);
+    st.timeWarp = warpValue > 0.f ? warpValue : 1.f;
+    st.speedPortalX = speed.x;
+    st.speedPortalId = speed.id;
     return st;
 }
 
@@ -251,8 +268,9 @@ static StartPosObject* createRunStartPos(PlayLayer* pl, float targetX) {
     // 105 = altura normal de salida; la altura buena la eliges luego con el raton
     placeStartPos(sp, {targetX, 105.f});
 
-    log::info("Tramo en X={}: modo {}, velocidad {}, gravedad {}, mini {}, dual {}, espejo {}",
-        targetX, st.mode, st.speedValue, st.flipped, st.mini, st.dual, st.mirror);
+    log::info("Tramo en X={}: modo {}, velocidad {} (portal id {} en X={}), time warp {}, gravedad {}, mini {}, dual {}, espejo {}",
+        targetX, st.mode, st.speedValue, st.speedPortalId, st.speedPortalX, st.timeWarp,
+        st.flipped, st.mini, st.dual, st.mirror);
     return sp;
 }
 
@@ -292,13 +310,24 @@ static std::optional<float> detectPathY(PlayLayer* pl, float x) {
     return ys[ys.size() / 2];
 }
 
-// Por si acaso: fija la velocidad del jugador a la que toca en su X
-static void fixPlayerSpeed(PlayLayer* pl) {
-    auto st = levelStateAt(pl, pl->m_player1->getPositionX());
+// Fija la velocidad del jugador (portal) y del juego (Time Warp) a la que
+// toca en su X
+static void fixPlayerSpeed(PlayLayer* pl, char const* when) {
+    float x = pl->m_player1->getPositionX();
+    auto st = levelStateAt(pl, x);
+    float before = pl->m_player1->m_playerSpeed;
+    float warpBefore = pl->m_gameState.m_timeWarp;
+
     pl->m_player1->updateTimeMod(st.speedValue, true);
     if (pl->m_player2 && pl->m_player2->isVisible()) {
         pl->m_player2->updateTimeMod(st.speedValue, true);
     }
+    if (std::abs(pl->m_gameState.m_timeWarp - st.timeWarp) > 0.001f) {
+        pl->updateTimeWarp(st.timeWarp);
+    }
+
+    log::info("[{}] X={} velocidad {} -> {} (portal id {} en X={}), time warp {} -> {}",
+        when, x, before, st.speedValue, st.speedPortalId, st.speedPortalX, warpBefore, st.timeWarp);
 }
 
 // ------------------------------------------------------------
@@ -361,7 +390,7 @@ protected:
         player->setPosition(player->m_position);
         player->m_yVelocity = 0.0;
 
-        fixPlayerSpeed(pl);
+        fixPlayerSpeed(pl, "elegir altura");
 
         g_run.placingOwn = true;
         pl->markCheckpoint();
@@ -624,6 +653,7 @@ class $modify(PRPlayLayer, PlayLayer) {
     void loadFromCheckpoint(CheckpointObject* object) {
         PlayLayer::loadFromCheckpoint(object);
         if (g_run.state == RunState::Running) {
+            fixPlayerSpeed(this, "reaparecer");
             g_run.syncFrames = 2;  // esperar a que el juego termine el reinicio
         }
     }
