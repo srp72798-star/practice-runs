@@ -24,7 +24,7 @@ using namespace geode::prelude;
 
 namespace {
     constexpr int kMaxBatch = 1000;
-    constexpr char const* kBridgeVersion = "0.2.0";
+    constexpr char const* kBridgeVersion = "0.2.1";
 
     // ---------------- respuestas ----------------
 
@@ -53,7 +53,9 @@ namespace {
             }
         });
         if (future.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
-            return fail("timeout", "El juego no respondio a tiempo (puede estar en una pantalla de carga)", 504);
+            return fail("game_not_running",
+                "El juego no proceso la peticion en 10 s. Geometry Dash tiene que estar en modo ventana "
+                "y sin minimizar (en pantalla completa se pausa al perder el foco).", 504);
         }
         return future.get();
     }
@@ -174,12 +176,16 @@ namespace {
         return std::nullopt;
     }
 
+    // En el texto del nivel la Y se cuenta desde el suelo (y=90 del editor).
+    // Comprobado en el juego: "3,105" acababa en y=195.
+    constexpr double kGroundOffsetY = 90.0;
+
     // Formato de objetos del nivel: 1=id, 2=x, 3=y, 4=flipX, 5=flipY,
     // 6=rotacion, 128/129=escala X/Y
     std::string toObjectString(std::vector<ObjectSpec> const& specs) {
         std::string out;
         for (auto const& s : specs) {
-            out += fmt::format("1,{},2,{},3,{}", s.id, numberToString(s.x), numberToString(s.y));
+            out += fmt::format("1,{},2,{},3,{}", s.id, numberToString(s.x), numberToString(s.y - kGroundOffsetY));
             if (s.flipX) out += ",4,1";
             if (s.flipY) out += ",5,1";
             if (s.rotation != 0) out += ",6," + numberToString(s.rotation);
@@ -205,19 +211,30 @@ namespace {
         // Un solo paso de deshacer para todo el lote (Ctrl+Z del editor)
         editor->addToUndoList(UndoObject::createWithArray(created, UndoCommand::Paste), false);
 
-        // Verificacion real: leer los objetos creados desde el juego
+        // Verificacion real: leer los objetos creados desde el juego y
+        // comprobar que estan en el nivel y donde se pidieron
         auto list = matjson::Value::array();
         int inLevel = 0;
+        int misplaced = 0;
+        size_t index = 0;
         for (auto obj : CCArrayExt<GameObject*>(created)) {
             bool present = editor->m_objects->containsObject(obj);
             if (present) inLevel++;
+            bool placed = true;
+            if (index < specs.size()) {
+                placed = std::abs(obj->getPositionX() - specs[index].x) < 0.5 &&
+                         std::abs(obj->getPositionY() - specs[index].y) < 0.5;
+            }
+            if (!placed) misplaced++;
             list.push(matjson::makeObject({
                 {"uid", obj->m_uniqueID},
                 {"id", obj->m_objectID},
                 {"x", obj->getPositionX()},
                 {"y", obj->getPositionY()},
                 {"inLevel", present},
+                {"positionOk", placed},
             }));
+            index++;
         }
         int after = static_cast<int>(editor->m_objects->count());
 
@@ -225,10 +242,11 @@ namespace {
             specs.size(), created->count(), inLevel, before, after);
 
         return reply(matjson::makeObject({
-            {"ok", inLevel == static_cast<int>(specs.size())},
+            {"ok", inLevel == static_cast<int>(specs.size()) && misplaced == 0},
             {"requested", static_cast<int>(specs.size())},
             {"created", static_cast<int>(created->count())},
             {"verifiedInLevel", inLevel},
+            {"misplaced", misplaced},
             {"objectCountBefore", before},
             {"objectCountAfter", after},
             {"objects", list},
