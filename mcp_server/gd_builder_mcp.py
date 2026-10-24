@@ -128,6 +128,8 @@ ALLOWED_PROPS = {
     "175": "shader speed", "176": "shader strength", "177": "shader time off", "179": "shader wave width",
     "180": "shader target X", "189": "shader target Y", "181": "shader fade in", "182": "shader fade out",
     "183": "shader inner", "191": "shader outer", "184": "shader invert", "188": "shader use X", "190": "shader use Y",
+    "56": "toggle: activar grupo", "58": "move: seguir al jugador en X", "59": "move: seguir al jugador en Y",
+    "143": "move: multiplicador X al seguir", "144": "move: multiplicador Y al seguir",
 }
 
 GroupList = Annotated[list[Annotated[int, Field(ge=1, le=9999)]], Field(max_length=10)]
@@ -152,6 +154,8 @@ class ObjectSpec(BaseModel):
     flipY: bool = False
     groups: Annotated[GroupList | None, Field(description="grupos del objeto (para moverlo/ocultarlo con triggers)")] = None
     props: Annotated[Props | None, Field(description="propiedades avanzadas por clave: " + ", ".join(f"{k}={d}" for k, d in ALLOWED_PROPS.items()))] = None
+    text: Annotated[str | None, Field(min_length=1, max_length=80, pattern=r"^[ -~]+$",
+                                      description="texto para objetos de texto (id 914), sin acentos")] = None
 
     _v = field_validator("props")(classmethod(lambda cls, v: _check_props(v)))
 
@@ -574,32 +578,69 @@ def _gen_corridor(rng: random.Random, start: int, plan: SectionPlan, prev: dict 
     return objs, {"mode": plan.mode, "obstacles": count, "height": h}
 
 
-def _decorate(i: int, start: int, plan: SectionPlan, objs: list, first: bool) -> list:
-    """Glow style basico: colores por seccion (fondo oscuro, suelo, linea y
-    bloques del color del modo, glow con blending) y un pulso al empezar."""
+GLOW_EDGE = 503              # d_gradient_01: brillo blanco abajo que se desvanece hacia arriba
+AIR_DECO = (50, 51, 53, 54)   # d_ball: circulo, aro, rombo, estrella (solo decoracion; 52 es un corazon)
+CH_DIM = 12                  # decoracion de fondo, apagada
+
+
+def _decorate(i: int, start: int, plan: SectionPlan, objs: list, first: bool, rng: random.Random) -> list:
+    """Glow style: colores por seccion (fondo oscuro, suelo, linea, bordes de
+    bloque del color del modo, glow con blending), glow en cada cara visible
+    de los bloques, decoracion en el aire detras del jugador, y efectos 2.2
+    (pulse al entrar, shake/zoom en algunos modos)."""
     bg, acc = PALETTES[plan.mode]
     dur = 0 if first else 0.6
+    end = start + plan.length_blocks
     x0 = start * 30 + 15
-    def col_trig(dy: int, channel: int, rgb, blending: bool = False) -> dict:
+    def trig(slot: int, oid: int, props: dict) -> dict:
+        return {"id": oid, "x": x0 + (slot // 8) * 30, "y": 405 + (slot % 8) * 30, "props": props, "_role": "trigger"}
+    def col_trig(slot: int, channel: int, rgb, blending: bool = False) -> dict:
         p = {"23": channel, "7": rgb[0], "8": rgb[1], "9": rgb[2], "10": dur}
         if blending:
             p["17"] = True
-        return {"id": 899, "x": x0, "y": 400 + dy * 30, "props": p, "_role": "trigger"}
+        return trig(slot, 899, p)
     dark = tuple(max(0, int(v * 0.6)) for v in bg)
-    block = tuple(int(v * 0.2) for v in acc)
+    edge = tuple(int(v * 0.8) for v in acc)
+    dim = tuple(int(v * 0.35) for v in acc)
     out = [
         col_trig(0, 1000, bg),
         col_trig(1, 1001, dark),
         col_trig(2, 1002, acc),
-        col_trig(3, CH_BLOCK, block),
+        col_trig(3, CH_BLOCK, edge),
         col_trig(4, CH_GLOW, acc, blending=True),
+        col_trig(5, CH_DIM, dim, blending=True),
     ]
     if not first:
-        # pulso blanco corto del glow al entrar en cada seccion
-        out.append({"id": 1006, "x": x0, "y": 400 + 5 * 30, "_role": "trigger",
-                    "props": {"23": CH_GLOW, "52": 0, "7": 255, "8": 255, "9": 255, "45": 0, "46": 0.1, "47": 0.4}})
+        # pulso blanco corto del glow al entrar en cada seccion (2.2: pulse por canal)
+        out.append(trig(6, 1006, {"23": CH_GLOW, "52": 0, "7": 255, "8": 255, "9": 255, "45": 0, "46": 0.1, "47": 0.5}))
+        out.append(trig(7, 1520, {"75": 1.5, "84": 0.05, "10": 0.3}))          # sacudida corta
+    out.append(trig(8, 1913, {"371": 0.9 if plan.mode in ("wave", "ufo") else 1.0, "10": 1}))  # zoom de camara
+
+    # Glow en las caras visibles de los bloques (sin tocar celdas ocupadas)
+    occupied = {(round((o["x"] - 15) / 30), round((o["y"] - 105) / 30)) for o in objs if o.get("_role") != "trigger"}
+    solid = {(round((o["x"] - 15) / 30), round((o["y"] - 105) / 30)) for o in objs
+             if o["id"] == BLOCK and o.get("_role") in ("solid", "ceiling")}
+    top_row = CORRIDOR_MODES[plan.mode][1] if plan.mode in CORRIDOR_MODES else 99
+    for (c, r) in sorted(solid):
+        # (dc, dr, rotacion): la parte brillante del 503 queda pegada al bloque
+        for dc, dr, rot in ((0, 1, 0), (0, -1, 180), (1, 0, 90), (-1, 0, 270)):
+            n = (c + dc, r + dr)
+            if n in occupied or n[1] < 0 or n[1] > top_row or not (start <= n[0] < end):
+                continue
+            occupied.add(n)
+            out.append({**_cell(n[0], n[1], GLOW_EDGE, "deco"), "rotation": rot, "props": {"21": CH_GLOW, "24": -1}})
+    # Decoracion en el aire, por encima del pasillo / del salto
+    air_from = (top_row + 2) if plan.mode in CORRIDOR_MODES else 4
+    for c in range(start + 3, end - 3, 4):
+        if rng.random() < 0.6:
+            r = air_from + rng.randint(0, 3)
+            if (c, r) in occupied:
+                continue
+            occupied.add((c, r))
+            out.append({**_cell(c, r, rng.choice(AIR_DECO), "deco"), "rotation": rng.choice((0, 45, 90)),
+                        "scale": round(rng.uniform(0.5, 1.3), 2), "props": {"21": CH_DIM, "24": -3}})
     for o in objs:
-        if o["_role"] in ("solid", "ceiling") and o["id"] == BLOCK:
+        if o["id"] == BLOCK and o.get("_role") in ("solid", "ceiling"):
             o.setdefault("props", {})["21"] = CH_BLOCK
     return out
 
@@ -614,7 +655,7 @@ def generate_level(sections: list[SectionPlan], start_col: int, seed: int, color
         else:
             objs, info = _gen_corridor(rng, col, plan, prev)
         if colors:
-            objs += _decorate(i, col, plan, objs, prev is None)
+            objs += _decorate(i, col, plan, objs, prev is None, rng)
         info.update({"index": i, "difficulty": plan.difficulty, "fromX": col * 30, "toX": (col + plan.length_blocks) * 30,
                      "objects": len(objs)})
         out.append(objs)
@@ -732,6 +773,60 @@ def gd_set_editor_view(
     para revisar con capturas de pantalla lo que se ha construido."""
     return _safe("set_editor_view", {"x": x, "y": y, "zoom": zoom})
 
+
+
+PLANS_DIR = Path(__file__).with_name("plans")
+
+
+@mcp.tool()
+def gd_build_from_plan(
+    name: Annotated[str, Field(pattern=r"^[a-z0-9_-]{1,40}$", description="nombre del plan (archivo plans/<name>.json)")],
+    only_section: Annotated[str | None, Field(max_length=40)] = None,
+    dry_run: bool = False,
+) -> dict:
+    """Construye un nivel a partir de un plan JSON guardado en la carpeta
+    plans del servidor ({"sections": [{"name", "objects": [...]}]}). Los
+    objetos se validan igual que en gd_add_objects_batch (son datos, no
+    codigo). Cada seccion es un lote propio que se puede deshacer. Solo
+    construye si la zona de cada seccion esta vacia."""
+    path = PLANS_DIR / f"{name}.json"
+    if not path.exists():
+        return {"ok": False, "error": "not_found", "message": f"No existe {path}"}
+    try:
+        plan = json.loads(path.read_text(encoding="utf-8"))
+        sections = plan["sections"]
+        parsed = []
+        for sec in sections:
+            if only_section and sec["name"] != only_section:
+                continue
+            objs = [ObjectSpec(**o).model_dump(exclude_none=True) for o in sec["objects"]]
+            parsed.append((str(sec["name"])[:40], objs))
+    except Exception as e:  # datos invalidos: no se construye nada
+        return {"ok": False, "error": "invalid_plan", "message": str(e)[:500]}
+    total = sum(len(o) for _, o in parsed)
+    info = [{"name": n, "objects": len(o), "fromX": min(x["x"] for x in o), "toX": max(x["x"] for x in o)} for n, o in parsed]
+    if dry_run or not parsed:
+        return {"ok": True, "dryRun": True, "totalObjects": total, "sections": info}
+    batches = []
+    for (sec_name, objs), meta in zip(parsed, info):
+        zone = _safe("get_objects_in_area", {"x1": meta["fromX"] - 1, "x2": meta["toX"] + 1, "limit": 1})
+        if not zone.get("ok"):
+            return {"ok": False, "error": "bridge", "detail": zone, "batches": batches}
+        if zone.get("total", 0) > 0:
+            return {"ok": False, "error": "zone_not_empty", "section": sec_name, "batches": batches,
+                    "message": f"Ya hay objetos entre x={meta['fromX']} y x={meta['toX']}"}
+        run = f"plan-{name}-{sec_name}-{uuid.uuid4().hex[:8]}"
+        for part in range(0, len(objs), MAX_BATCH):
+            res = _safe("add_objects_batch", {"objects": objs[part:part + MAX_BATCH]}, f"{run}-{part // MAX_BATCH}")
+            entry = {"section": sec_name, "ok": res.get("ok"), "created": res.get("created"),
+                     "misplaced": res.get("misplaced"), "propsWrong": res.get("propsWrong")}
+            if res.get("propsWrong"):
+                entry["wrong"] = [o for o in res.get("objects", []) if o.get("propsWrong")][:5]
+            batches.append(entry)
+            if not res.get("created"):
+                return {"ok": False, "error": "build_failed", "detail": res, "batches": batches}
+    log.info("plan %s construido: %d objetos", name, total)
+    return {"ok": all(b["ok"] for b in batches), "totalObjects": total, "batches": batches}
 
 
 @mcp.prompt()
