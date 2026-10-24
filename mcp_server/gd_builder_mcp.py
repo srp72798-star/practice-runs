@@ -154,5 +154,98 @@ def gd_add_objects_batch(
     return result
 
 
+class ObjectChange(BaseModel):
+    uid: Annotated[int, Field(description="uid del objeto (lo devuelven gd_add_objects_batch y gd_get_objects_in_area)")]
+    x: Annotated[float, Field(ge=-1000, le=1_000_000)] | None = None
+    y: Annotated[float, Field(ge=-3000, le=30_000)] | None = None
+    dx: Annotated[float, Field(ge=-100_000, le=100_000, description="desplazamiento relativo en X")] | None = None
+    dy: Annotated[float, Field(ge=-30_000, le=30_000, description="desplazamiento relativo en Y")] | None = None
+    rotation: Annotated[float, Field(ge=-360, le=360)] | None = None
+    scale: Annotated[float, Field(ge=0.1, le=10)] | None = None
+    flipX: bool | None = None
+    flipY: bool | None = None
+
+
+class Area(BaseModel):
+    x1: float
+    x2: float
+    y1: float
+    y2: float
+
+
+@mcp.tool()
+def gd_get_object_catalog(
+    query: Annotated[str, Field(max_length=60, description="Texto a buscar en el nombre de imagen del objeto, p. ej. 'spike', 'portal', 'square'")] = "",
+    limit: Annotated[int, Field(ge=1, le=500)] = 100,
+    offset: Annotated[int, Field(ge=0)] = 0,
+) -> dict:
+    """Lista de objetos que existen en el juego (id + nombre de su imagen),
+    leida del propio Geometry Dash. Usala para encontrar IDs validos en vez
+    de inventarlos."""
+    return _safe("get_object_catalog", {"query": query, "limit": limit, "offset": offset})
+
+
+@mcp.tool()
+def gd_get_objects_in_area(
+    x1: float = -1e9, x2: float = 1e9, y1: float = -1e9, y2: float = 1e9,
+    id: Annotated[int, Field(ge=1, le=10000)] | None = None,
+    limit: Annotated[int, Field(ge=1, le=2000)] = 500,
+) -> dict:
+    """Objetos del nivel abierto dentro de un rectangulo (coordenadas del
+    editor). Devuelve uid, id, x, y, rotation, scale y flips. Sirve para
+    revisar lo creado y conseguir los uid que piden modificar/borrar."""
+    payload = {"x1": x1, "x2": x2, "y1": y1, "y2": y2, "limit": limit}
+    if id is not None:
+        payload["id"] = id
+    return _safe("get_objects_in_area", payload)
+
+
+@mcp.tool()
+def gd_modify_objects_batch(
+    changes: Annotated[list[ObjectChange], Field(min_length=1, max_length=MAX_BATCH)],
+    batch_id: str | None = None,
+) -> dict:
+    """Modifica varios objetos a la vez (posicion absoluta x/y o relativa
+    dx/dy, rotacion, escala, volteo). Se conservan el resto de propiedades.
+    Importante: cada objeto modificado recibe un uid NUEVO (ver oldUid -> uid
+    en la respuesta). Se puede revertir con gd_undo_last_batch."""
+    key = batch_id or f"modify-{uuid.uuid4()}"
+    payload = {"changes": [c.model_dump(exclude_none=True) for c in changes]}
+    result = _safe("modify_objects_batch", payload, key)
+    result.setdefault("batchId", key)
+    return result
+
+
+@mcp.tool()
+def gd_delete_objects_batch(
+    uids: Annotated[list[int], Field(min_length=1, max_length=2000)] | None = None,
+    area: Area | None = None,
+    confirm: bool = False,
+    batch_id: str | None = None,
+) -> dict:
+    """Borra objetos por uid o por area. Borrar mas de 200 objetos exige
+    confirm=true (pidele permiso al usuario antes). Se puede revertir con
+    gd_undo_last_batch."""
+    if (uids is None) == (area is None):
+        return {"ok": False, "error": "invalid_params", "message": "Indica 'uids' o 'area' (solo uno)"}
+    key = batch_id or f"delete-{uuid.uuid4()}"
+    payload: dict = {"confirm": confirm}
+    if uids is not None:
+        payload["uids"] = uids
+    else:
+        payload["area"] = area.model_dump()
+    result = _safe("delete_objects_batch", payload, key)
+    result.setdefault("batchId", key)
+    return result
+
+
+@mcp.tool()
+def gd_undo_last_batch() -> dict:
+    """Deshace el ultimo lote hecho por la IA en este nivel (anadir,
+    modificar o borrar). Se pueden deshacer hasta 50 lotes seguidos."""
+    # Clave unica: si la conexion falla y se reintenta, no se deshacen dos lotes
+    return _safe("undo_last_batch", {}, f"undo-{uuid.uuid4()}")
+
+
 if __name__ == "__main__":
     mcp.run()
