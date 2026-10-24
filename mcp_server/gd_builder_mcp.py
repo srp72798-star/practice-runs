@@ -577,12 +577,13 @@ def gd_build_level(
     para eso usa gd_save_level y pide permiso al usuario."""
     summary = None
     if start_x is None:
-        if dry_run:
+        # Igual en dry_run, para que el plan ensene la X real (visto en la Fase 7)
+        summary = _safe("get_level_summary")
+        if not summary.get("ok"):
+            if not dry_run:
+                return summary
             start_col = 0
         else:
-            summary = _safe("get_level_summary")
-            if not summary.get("ok"):
-                return summary
             start_col = 0 if summary["objectCount"] == 0 else int(summary["bounds"]["maxX"] // 30) + 10
     else:
         start_col = int(start_x // 30)
