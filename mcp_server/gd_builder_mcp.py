@@ -122,6 +122,12 @@ ALLOWED_PROPS = {
     "23": "canal de color objetivo", "28": "move X", "29": "move Y",
     "30": "easing (0-18)", "35": "opacidad (0-1)", "51": "grupo objetivo",
     "62": "spawn triggered", "85": "easing rate", "87": "multi trigger",
+    "20": "capa del editor", "24": "capa Z (-5,-3,-1,0,1,3,5,7,9,11)", "25": "orden Z",
+    "45": "pulse fade in", "46": "pulse hold", "47": "pulse fade out", "48": "pulse modo", "52": "pulse objetivo (0 canal, 1 grupo)",
+    "371": "zoom de camara", "75": "shake fuerza", "84": "shake intervalo",
+    "175": "shader speed", "176": "shader strength", "177": "shader time off", "179": "shader wave width",
+    "180": "shader target X", "189": "shader target Y", "181": "shader fade in", "182": "shader fade out",
+    "183": "shader inner", "191": "shader outer", "184": "shader invert", "188": "shader use X", "190": "shader use Y",
 }
 
 GroupList = Annotated[list[Annotated[int, Field(ge=1, le=9999)]], Field(max_length=10)]
@@ -433,89 +439,169 @@ def gd_save_level(confirm: bool = False) -> dict:
     return _safe("save_level", {"confirm": confirm}, f"save-{uuid.uuid4()}")
 
 
-# ---------------------------------------------------------------- fase 6: niveles completos
+# ---------------------------------------------------------------- fase 6/8: niveles completos
 #
-# Generador determinista de secciones jugables a velocidad 1x. Solo usa
-# patrones sencillos (pinchos, bloques, escaleras, pasillos de nave) para no
-# crear saltos imposibles. Cuadricula: columna c -> x = 30*c + 15;
-# fila r -> y = 105 + 30*r (fila 0 = apoyada en el suelo).
+# Generador determinista de niveles jugables a velocidad 1x con todos los
+# modos menos swing. Cuadricula: columna c -> x = 30*c + 15; fila r ->
+# y = 105 + 30*r (fila 0 = apoyada en el suelo).
+#
+# Reglas para que no haya fallos:
+#  - Todos los portales de modo van a y=135 (fila 1). Antes de cada portal
+#    los modos con pasillo tienen un "embudo" (techo bajado hasta la fila 3)
+#    para que el jugador pase si o si por el portal.
+#  - Bola y arana terminan con dos portales de gravedad normal apilados
+#    (filas 1 y 3) bastante antes del embudo, para no salir boca abajo.
+#  - Ningun obstaculo en los ultimos bloques de cada seccion.
 
 import random
 
 BLOCK, SPIKE = GAMEPLAY_IDS["block"], GAMEPLAY_IDS["spike"]
-CUBE_PATTERNS = {
-    # nombre: (dificultad minima, [(col, fila, id)])
-    "pincho": ("easy", [(0, 0, SPIKE)]),
-    "bloque": ("easy", [(0, 0, BLOCK)]),
-    "escalera": ("easy", [(0, 0, BLOCK), (1, 0, BLOCK), (2, 0, BLOCK), (2, 1, BLOCK), (3, 1, BLOCK), (4, 1, BLOCK)]),
-    "doble_pincho": ("normal", [(0, 0, SPIKE), (1, 0, SPIKE)]),
-    "bloque_y_pinchos": ("normal", [(0, 0, BLOCK), (2, 0, SPIKE), (3, 0, SPIKE)]),
-    "triple_pincho": ("hard", [(0, 0, SPIKE), (1, 0, SPIKE), (2, 0, SPIKE)]),
-    "bloque_y_3_pinchos": ("hard", [(0, 0, BLOCK), (2, 0, SPIKE), (3, 0, SPIKE), (4, 0, SPIKE)]),
-}
+GRAVITY_NORMAL = GAMEPLAY_IDS["gravity_normal"]
 DIFF_ORDER = {"easy": 0, "normal": 1, "hard": 2}
-CUBE_GAP = {"easy": 7, "normal": 5, "hard": 4}          # bloques libres entre patrones
-SHIP_HEIGHT = {"easy": 7, "normal": 6, "hard": 5}       # alto del pasillo de nave
-SHIP_OPENING = {"easy": 4, "normal": 3, "hard": 3}      # hueco minimo junto a un pilar
-SHIP_SPACING = {"easy": 8, "normal": 6, "hard": 5}      # bloques entre pilares
-SECTION_COLORS = [(40, 90, 200), (150, 40, 180), (30, 150, 90), (200, 90, 30), (180, 30, 60), (30, 140, 170)]
+
+GROUND_PATTERNS = {
+    # nombre: (dificultad minima, modos, [(col, fila, id)])
+    "pincho": ("easy", ("cube", "robot"), [(0, 0, SPIKE)]),
+    "bloque": ("easy", ("cube", "robot"), [(0, 0, BLOCK)]),
+    "escalera": ("easy", ("cube",), [(0, 0, BLOCK), (1, 0, BLOCK), (2, 0, BLOCK), (2, 1, BLOCK), (3, 1, BLOCK), (4, 1, BLOCK)]),
+    "doble_pincho": ("normal", ("cube", "robot"), [(0, 0, SPIKE), (1, 0, SPIKE)]),
+    "bloque_y_pinchos": ("normal", ("cube",), [(0, 0, BLOCK), (2, 0, SPIKE), (3, 0, SPIKE)]),
+    "pared_alta": ("easy", ("robot",), [(0, 0, BLOCK), (0, 1, BLOCK)]),
+    "triple_pincho": ("hard", ("cube",), [(0, 0, SPIKE), (1, 0, SPIKE), (2, 0, SPIKE)]),
+    "bloque_y_3_pinchos": ("hard", ("cube",), [(0, 0, BLOCK), (2, 0, SPIKE), (3, 0, SPIKE), (4, 0, SPIKE)]),
+}
+GROUND_GAP = {"easy": 7, "normal": 5, "hard": 4}
+
+# modo: (portal, alto del pasillo, separacion por dificultad, invierte gravedad)
+CORRIDOR_MODES = {
+    "ship": ("portal_ship", 6, {"easy": 8, "normal": 6, "hard": 5}, False),
+    "ball": ("portal_ball", 5, {"easy": 12, "normal": 10, "hard": 8}, True),
+    "ufo": ("portal_ufo", 6, {"easy": 10, "normal": 8, "hard": 7}, False),
+    "wave": ("portal_wave", 6, {"easy": 10, "normal": 9, "hard": 7}, False),
+    "spider": ("portal_spider", 5, {"easy": 9, "normal": 7, "hard": 6}, True),
+}
+GROUND_MODES = {"cube": "portal_cube", "robot": "portal_robot"}
+ALL_MODES = tuple(GROUND_MODES) + tuple(CORRIDOR_MODES)
+PORTAL_Y = 135
+
+# Paletas glow style por modo: (fondo oscuro, acento)
+PALETTES = {
+    "cube": ((12, 10, 40), (0, 200, 255)),
+    "ship": ((30, 0, 40), (255, 60, 200)),
+    "ball": ((0, 30, 25), (0, 255, 150)),
+    "ufo": ((35, 25, 0), (255, 200, 0)),
+    "wave": ((40, 0, 10), (255, 40, 60)),
+    "robot": ((0, 15, 40), (60, 120, 255)),
+    "spider": ((25, 0, 40), (190, 80, 255)),
+}
+CH_BLOCK, CH_GLOW = 10, 11   # canales de color propios del nivel
 
 
-def _cell(col: int, row: int, oid: int, **extra) -> dict:
-    o = {"id": oid, "x": col * 30 + 15, "y": 105 + row * 30}
+def _cell(col: int, row: int, oid: int, role: str = "solid", **extra) -> dict:
+    o = {"id": oid, "x": col * 30 + 15, "y": 105 + row * 30, "_role": role}
     o.update(extra)
     return o
 
 
 class SectionPlan(BaseModel):
-    mode: Literal["cube", "ship"]
-    length_blocks: Annotated[int, Field(ge=20, le=300)]
+    mode: Literal["cube", "robot", "ship", "ball", "ufo", "wave", "spider"]
+    length_blocks: Annotated[int, Field(ge=30, le=300)]
     difficulty: Literal["easy", "normal", "hard"] = "easy"
 
 
-def _gen_cube(rng: random.Random, start: int, plan: SectionPlan, prev: dict | None) -> tuple[list, dict]:
+def _gen_ground(rng: random.Random, start: int, plan: SectionPlan, prev: dict | None) -> tuple[list, dict]:
     objs, used = [], []
     end = start + plan.length_blocks
-    col = start + 2
-    if prev and prev["mode"] != "cube":
-        objs.append(_cell(start + 1, 0, GAMEPLAY_IDS["portal_cube"], y=prev["center_y"]))
-        col = start + 8                      # sitio para caer al suelo
+    if prev is None:
+        col = start + 12
     else:
-        col = start + (12 if prev is None else 4)
-    allowed = [n for n, (d, _) in CUBE_PATTERNS.items() if DIFF_ORDER[d] <= DIFF_ORDER[plan.difficulty]]
+        if prev["mode"] != plan.mode:
+            objs.append(_cell(start + 1, 0, GAMEPLAY_IDS[GROUND_MODES[plan.mode]], "portal", y=PORTAL_Y))
+        col = start + 8
+    allowed = [n for n, (d, modes, _) in GROUND_PATTERNS.items()
+               if plan.mode in modes and DIFF_ORDER[d] <= DIFF_ORDER[plan.difficulty]]
     while True:
         name = rng.choice(allowed)
-        cells = CUBE_PATTERNS[name][1]
+        cells = GROUND_PATTERNS[name][2]
         width = max(c for c, _, _ in cells) + 1
-        if col + width > end - 4:
+        if col + width > end - 6:
             break
         for c, r, oid in cells:
-            objs.append(_cell(col + c, r, oid))
+            objs.append(_cell(col + c, r, oid, "hazard" if oid == SPIKE else "solid"))
         used.append(name)
-        col += width + CUBE_GAP[plan.difficulty] + rng.randint(0, 2)
-    return objs, {"mode": "cube", "patterns": used, "center_y": 135}
+        col += width + GROUND_GAP[plan.difficulty] + rng.randint(0, 2)
+    return objs, {"mode": plan.mode, "patterns": used}
 
 
-def _gen_ship(rng: random.Random, start: int, plan: SectionPlan, prev: dict | None) -> tuple[list, dict]:
-    objs = []
+def _gen_corridor(rng: random.Random, start: int, plan: SectionPlan, prev: dict | None) -> tuple[list, dict]:
+    portal, h, spacing, flips = CORRIDOR_MODES[plan.mode]
+    d = plan.difficulty
     end = start + plan.length_blocks
-    h = SHIP_HEIGHT[plan.difficulty]
-    center_y = 105 + (h - 1) * 30 / 2
-    objs.append(_cell(start + 1, 0, GAMEPLAY_IDS["portal_ship"], y=center_y))
-    for c in range(start + 4, end - 2):
-        objs.append(_cell(c, h, BLOCK))                     # techo del pasillo
-    pillars = 0
-    top = rng.random() < 0.5
-    pillar_h = h - SHIP_OPENING[plan.difficulty]
-    col = start + 10
-    while col <= end - 8 and pillar_h > 0:
-        rows = range(h - pillar_h, h) if top else range(0, pillar_h)
-        for r in rows:
-            objs.append(_cell(col, r, BLOCK))
-        pillars += 1
-        top = not top
-        col += SHIP_SPACING[plan.difficulty] + rng.randint(0, 2)
-    return objs, {"mode": "ship", "pillars": pillars, "center_y": center_y, "height": h}
+    objs = [_cell(start + 1, 0, GAMEPLAY_IDS[portal], "portal", y=PORTAL_Y)]
+    funnel_from = end - 6
+    for c in range(start + 4, end):
+        objs.append(_cell(c, h, BLOCK, "ceiling"))
+        if c >= funnel_from:                               # embudo hacia el siguiente portal
+            for r in range(3, h):
+                objs.append(_cell(c, r, BLOCK, "ceiling"))
+    last_obstacle = end - (20 if flips else 14)
+    col = start + 12
+    count = 0
+    while col <= last_obstacle:
+        floor_turn = count % 2 == 0
+        if plan.mode in ("ball", "spider"):
+            k = 2 if d == "easy" else 3
+            row = 0 if floor_turn else h - 1
+            for i in range(k):
+                objs.append(_cell(col + i, row, SPIKE, "hazard", **({} if floor_turn else {"rotation": 180})))
+            col += k - 1
+        else:
+            if plan.mode == "ship":
+                p = h - (4 if d == "easy" else 3)
+            elif plan.mode == "ufo":
+                p = 2
+            else:  # wave
+                p = 2 if d == "easy" else 3
+            rows = range(0, p) if floor_turn else range(h - p, h)
+            for r in rows:
+                objs.append(_cell(col, r, BLOCK, "solid"))
+        count += 1
+        col += spacing[d] + rng.randint(0, 2)
+    if flips:
+        # vuelta a gravedad normal, con sitio para caer antes del embudo
+        objs.append(_cell(end - 12, 1, GRAVITY_NORMAL, "portal"))
+        objs.append(_cell(end - 12, 3, GRAVITY_NORMAL, "portal"))
+    return objs, {"mode": plan.mode, "obstacles": count, "height": h}
+
+
+def _decorate(i: int, start: int, plan: SectionPlan, objs: list, first: bool) -> list:
+    """Glow style basico: colores por seccion (fondo oscuro, suelo, linea y
+    bloques del color del modo, glow con blending) y un pulso al empezar."""
+    bg, acc = PALETTES[plan.mode]
+    dur = 0 if first else 0.6
+    x0 = start * 30 + 15
+    def col_trig(dy: int, channel: int, rgb, blending: bool = False) -> dict:
+        p = {"23": channel, "7": rgb[0], "8": rgb[1], "9": rgb[2], "10": dur}
+        if blending:
+            p["17"] = True
+        return {"id": 899, "x": x0, "y": 400 + dy * 30, "props": p, "_role": "trigger"}
+    dark = tuple(max(0, int(v * 0.6)) for v in bg)
+    block = tuple(int(v * 0.2) for v in acc)
+    out = [
+        col_trig(0, 1000, bg),
+        col_trig(1, 1001, dark),
+        col_trig(2, 1002, acc),
+        col_trig(3, CH_BLOCK, block),
+        col_trig(4, CH_GLOW, acc, blending=True),
+    ]
+    if not first:
+        # pulso blanco corto del glow al entrar en cada seccion
+        out.append({"id": 1006, "x": x0, "y": 400 + 5 * 30, "_role": "trigger",
+                    "props": {"23": CH_GLOW, "52": 0, "7": 255, "8": 255, "9": 255, "45": 0, "46": 0.1, "47": 0.4}})
+    for o in objs:
+        if o["_role"] in ("solid", "ceiling") and o["id"] == BLOCK:
+            o.setdefault("props", {})["21"] = CH_BLOCK
+    return out
 
 
 def generate_level(sections: list[SectionPlan], start_col: int, seed: int, colors: bool) -> tuple[list[list], list[dict]]:
@@ -523,14 +609,12 @@ def generate_level(sections: list[SectionPlan], start_col: int, seed: int, color
     out, infos, prev = [], [], None
     col = start_col
     for i, plan in enumerate(sections):
-        if i == 0 and plan.mode != "cube":
-            prev = {"mode": "cube", "center_y": 135}
-        gen = _gen_cube if plan.mode == "cube" else _gen_ship
-        objs, info = gen(rng, col, plan, prev)
+        if plan.mode in GROUND_MODES:
+            objs, info = _gen_ground(rng, col, plan, prev)
+        else:
+            objs, info = _gen_corridor(rng, col, plan, prev)
         if colors:
-            r, g, b = SECTION_COLORS[i % len(SECTION_COLORS)]
-            objs.append({"id": 899, "x": col * 30 + 15, "y": 465,
-                         "props": {"23": 1000, "7": r, "8": g, "9": b, "10": 1}})
+            objs += _decorate(i, col, plan, objs, prev is None)
         info.update({"index": i, "difficulty": plan.difficulty, "fromX": col * 30, "toX": (col + plan.length_blocks) * 30,
                      "objects": len(objs)})
         out.append(objs)
@@ -540,19 +624,22 @@ def generate_level(sections: list[SectionPlan], start_col: int, seed: int, color
     return out, infos
 
 
+def _strip(objs: list) -> list:
+    return [{k: v for k, v in o.items() if not k.startswith("_")} for o in objs]
+
+
 def validate_level(sections: list[list]) -> list[str]:
-    """Comprobaciones basicas: sin objetos solapados y sin filas de mas de 3
-    pinchos seguidos en el suelo."""
-    issues, seen = [], set()
+    """Sin objetos solapados, sin mas de 3 pinchos seguidos en el suelo."""
+    issues, seen = [], {}
     ground_spikes = set()
     for objs in sections:
         for o in objs:
-            if o["id"] in (899,):
+            if o.get("_role") == "trigger":
                 continue
             key = (round(o["x"]), round(o["y"]))
-            if key in seen:
+            if key in seen and not (o["id"] == GRAVITY_NORMAL or seen[key] == GRAVITY_NORMAL):
                 issues.append(f"dos objetos en x={o['x']} y={o['y']}")
-            seen.add(key)
+            seen[key] = o["id"]
             if o["id"] == SPIKE and o["y"] == 105:
                 ground_spikes.add(round(o["x"]))
     for x in ground_spikes:
@@ -569,15 +656,15 @@ def gd_build_level(
     start_x: Annotated[float, Field(ge=0, le=900_000)] | None = None,
     dry_run: bool = False,
 ) -> dict:
-    """Construye un nivel jugable (velocidad 1x) por secciones de cubo y
-    nave, con dificultad easy/normal/hard. Cada seccion es un lote propio:
-    gd_undo_last_batch deshace la ultima seccion. Con dry_run=true solo
-    devuelve el plan sin tocar el juego. Por defecto empieza despues del
-    ultimo objeto del nivel. Solo construye si la zona esta vacia. NO guarda:
-    para eso usa gd_save_level y pide permiso al usuario."""
+    """Construye un nivel jugable (velocidad 1x) por secciones. Modos: cube,
+    robot, ship, ball, ufo, wave, spider; dificultad easy/normal/hard. Pone
+    los portales con embudo y portales de gravedad donde hace falta. Con
+    colors=true decora en glow style (colores por seccion, glow con
+    blending, pulsos). Cada seccion es un lote propio: gd_undo_last_batch
+    deshace la ultima. dry_run=true solo devuelve el plan. Solo construye si
+    la zona esta vacia. NO guarda: usa gd_save_level con permiso."""
     summary = None
     if start_x is None:
-        # Igual en dry_run, para que el plan ensene la X real (visto en la Fase 7)
         summary = _safe("get_level_summary")
         if not summary.get("ok"):
             if not dry_run:
@@ -590,11 +677,12 @@ def gd_build_level(
     built, infos = generate_level(sections, start_col, seed, colors)
     issues = validate_level(built)
     total = sum(len(o) for o in built)
-    plan = {"startX": start_col * 30, "endX": infos[-1]["toX"], "totalObjects": total, "sections": infos, "issues": issues}
+    plan = {"startX": start_col * 30, "endX": infos[-1]["toX"], "totalObjects": total, "sections": infos, "issues": issues,
+            "seconds": round((infos[-1]["toX"] - start_col * 30) / 311.58, 1)}
     if issues:
         return {"ok": False, "error": "invalid_plan", **plan}
-    if total > 5000:
-        return {"ok": False, "error": "too_big", "message": "Maximo 5000 objetos por llamada", **plan}
+    if total > 8000:
+        return {"ok": False, "error": "too_big", "message": "Maximo 8000 objetos por llamada", **plan}
     if dry_run:
         return {"ok": True, "dryRun": True, **plan}
 
@@ -608,9 +696,10 @@ def gd_build_level(
     run = f"level-{uuid.uuid4()}"
     batches = []
     for info, objs in zip(infos, built):
-        for part in range(0, len(objs), MAX_BATCH):
+        clean = _strip(objs)
+        for part in range(0, len(clean), MAX_BATCH):
             key = f"{run}-s{info['index']}-{part // MAX_BATCH}"
-            res = _safe("add_objects_batch", {"objects": objs[part:part + MAX_BATCH]}, key)
+            res = _safe("add_objects_batch", {"objects": clean[part:part + MAX_BATCH]}, key)
             batches.append({"section": info["index"], "batchId": key, "ok": res.get("ok"),
                             "created": res.get("created"), "propsWrong": res.get("propsWrong")})
             if not res.get("ok"):
@@ -618,6 +707,31 @@ def gd_build_level(
                         "message": "Se paro a mitad; los lotes ya creados se pueden deshacer con gd_undo_last_batch"}
     log.info("nivel construido %s: %d objetos en %d lotes", run, total, len(batches))
     return {"ok": True, "batches": batches, "undoHint": f"{len(batches)} llamadas a gd_undo_last_batch lo quitan todo", **plan}
+
+
+@mcp.tool()
+def gd_set_level_song(
+    song_id: Annotated[int, Field(ge=1, le=99_999_999, description="ID de Newgrounds o de la biblioteca de musica")] | None = None,
+    official_track: Annotated[int, Field(ge=0, le=100, description="cancion oficial de RobTop (0 = Stereo Madness)")] | None = None,
+) -> dict:
+    """Pone la cancion del nivel abierto. Se guarda al guardar el nivel. Si
+    no esta descargada, el usuario la descarga desde los ajustes del nivel."""
+    if (song_id is None) == (official_track is None):
+        return {"ok": False, "error": "invalid_params", "message": "Indica song_id u official_track (solo uno)"}
+    payload = {"songID": song_id} if song_id is not None else {"officialTrack": official_track}
+    return _safe("set_level_song", payload, f"song-{uuid.uuid4()}")
+
+
+@mcp.tool()
+def gd_set_editor_view(
+    x: Annotated[float, Field(ge=-1000, le=1_000_000)],
+    y: Annotated[float, Field(ge=-3000, le=30_000)] = 200,
+    zoom: Annotated[float, Field(ge=0.1, le=4)] = 0.6,
+) -> dict:
+    """Mueve la camara del editor para centrarla en (x, y) con un zoom. Util
+    para revisar con capturas de pantalla lo que se ha construido."""
+    return _safe("set_editor_view", {"x": x, "y": y, "zoom": zoom})
+
 
 
 @mcp.prompt()
