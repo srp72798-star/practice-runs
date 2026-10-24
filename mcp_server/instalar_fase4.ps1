@@ -75,10 +75,18 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "El servidor MCP no arranca" }
 
     # ---------- 4) Config de Claude Desktop
+    # La ruta buena es la que la propia app escribe en su log al arrancar
     $configs = @()
-    $configs += Join-Path $env:APPDATA "Claude\claude_desktop_config.json"
-    foreach ($pkg in (Get-ChildItem "$env:LOCALAPPDATA\Packages\Claude_*" -Directory -ErrorAction SilentlyContinue)) {
-        $configs += Join-Path $pkg.FullName "LocalCache\Roaming\Claude\claude_desktop_config.json"
+    $mainLog = Join-Path $env:LOCALAPPDATA "Claude\logs\main.log"
+    if (Test-Path $mainLog) {
+        $m = Select-String -Path $mainLog -Pattern 'Reading claude_desktop_config\.json from (.+claude_desktop_config\.json)' | Select-Object -Last 1
+        if ($m) { $configs += $m.Matches[0].Groups[1].Value.Trim(); Log "La app lee la configuracion de: $($configs[0])" }
+    }
+    if ($configs.Count -eq 0) {
+        $configs += Join-Path $env:APPDATA "Claude\claude_desktop_config.json"
+        foreach ($pkg in (Get-ChildItem "$env:LOCALAPPDATA\Packages\*Claude_*" -Directory -ErrorAction SilentlyContinue)) {
+            $configs += Join-Path $pkg.FullName "LocalCache\Roaming\Claude\claude_desktop_config.json"
+        }
     }
     $entry = [pscustomobject]@{ command = $venvPy; args = @((Join-Path $dest "gd_builder_mcp.py")) }
     $done = 0

@@ -18,10 +18,10 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------- config
 
@@ -113,6 +113,29 @@ def _safe(tool: str, payload: dict | None = None, key: str | None = None) -> dic
 
 # ---------------------------------------------------------------- esquemas
 
+# Propiedades permitidas (clave del formato de nivel de GD). El mod vuelve a
+# validarlas y comprueba despues que el juego las ha guardado.
+ALLOWED_PROPS = {
+    "7": "R del trigger de color (0-255)", "8": "G (0-255)", "9": "B (0-255)",
+    "10": "duracion en segundos", "11": "touch triggered", "17": "blending",
+    "21": "canal de color principal", "22": "canal de color de detalle",
+    "23": "canal de color objetivo", "28": "move X", "29": "move Y",
+    "30": "easing (0-18)", "35": "opacidad (0-1)", "51": "grupo objetivo",
+    "62": "spawn triggered", "85": "easing rate", "87": "multi trigger",
+}
+
+GroupList = Annotated[list[Annotated[int, Field(ge=1, le=9999)]], Field(max_length=10)]
+Props = dict[str, float | bool]
+
+
+def _check_props(v: Props | None) -> Props | None:
+    if v:
+        bad = [k for k in v if k not in ALLOWED_PROPS]
+        if bad:
+            raise ValueError(f"propiedades no permitidas: {bad}. Permitidas: {ALLOWED_PROPS}")
+    return v
+
+
 class ObjectSpec(BaseModel):
     id: Annotated[int, Field(ge=1, le=10000, description="ID de objeto de Geometry Dash (1 = bloque basico, 8 = pincho)")]
     x: Annotated[float, Field(ge=-1000, le=1_000_000, description="X en unidades del editor (30 = un bloque)")]
@@ -121,6 +144,10 @@ class ObjectSpec(BaseModel):
     scale: Annotated[float, Field(ge=0.1, le=10)] = 1
     flipX: bool = False
     flipY: bool = False
+    groups: Annotated[GroupList | None, Field(description="grupos del objeto (para moverlo/ocultarlo con triggers)")] = None
+    props: Annotated[Props | None, Field(description="propiedades avanzadas por clave: " + ", ".join(f"{k}={d}" for k, d in ALLOWED_PROPS.items()))] = None
+
+    _v = field_validator("props")(classmethod(lambda cls, v: _check_props(v)))
 
 
 # ---------------------------------------------------------------- herramientas
@@ -148,7 +175,7 @@ def gd_add_objects_batch(
     Usa el mismo batch_id si repites la llamada: no se duplicara.
     """
     key = batch_id or f"batch-{uuid.uuid4()}"
-    payload = {"objects": [o.model_dump() for o in objects]}
+    payload = {"objects": [o.model_dump(exclude_none=True) for o in objects]}
     result = _safe("add_objects_batch", payload, key)
     result.setdefault("batchId", key)
     return result
@@ -164,6 +191,10 @@ class ObjectChange(BaseModel):
     scale: Annotated[float, Field(ge=0.1, le=10)] | None = None
     flipX: bool | None = None
     flipY: bool | None = None
+    groups: Annotated[GroupList | None, Field(description="sustituye los grupos ([] = quitar todos)")] = None
+    props: Annotated[Props | None, Field(description="propiedades avanzadas a cambiar (mismas claves que en gd_add_objects_batch)")] = None
+
+    _v = field_validator("props")(classmethod(lambda cls, v: _check_props(v)))
 
 
 class Area(BaseModel):
@@ -190,11 +221,13 @@ def gd_get_objects_in_area(
     x1: float = -1e9, x2: float = 1e9, y1: float = -1e9, y2: float = 1e9,
     id: Annotated[int, Field(ge=1, le=10000)] | None = None,
     limit: Annotated[int, Field(ge=1, le=2000)] = 500,
+    details: bool = False,
 ) -> dict:
     """Objetos del nivel abierto dentro de un rectangulo (coordenadas del
-    editor). Devuelve uid, id, x, y, rotation, scale y flips. Sirve para
-    revisar lo creado y conseguir los uid que piden modificar/borrar."""
-    payload = {"x1": x1, "x2": x2, "y1": y1, "y2": y2, "limit": limit}
+    editor). Devuelve uid, id, x, y, rotation, scale y flips. Con
+    details=true tambien grupos y propiedades de trigger tal como las guarda
+    el juego (maximo 500). Sirve para revisar lo creado y conseguir los uid."""
+    payload = {"x1": x1, "x2": x2, "y1": y1, "y2": y2, "limit": limit, "details": details}
     if id is not None:
         payload["id"] = id
     return _safe("get_objects_in_area", payload)
@@ -223,9 +256,9 @@ def gd_delete_objects_batch(
     confirm: bool = False,
     batch_id: str | None = None,
 ) -> dict:
-    """Borra objetos por uid o por area. Borrar mas de 200 objetos exige
-    confirm=true (pidele permiso al usuario antes). Se puede revertir con
-    gd_undo_last_batch."""
+    """Borra objetos por uid o por area. Borrar mas de 100 objetos (o mas de
+    la cuarta parte del nivel) exige confirm=true: pidele permiso al usuario
+    antes. Se puede revertir con gd_undo_last_batch."""
     if (uids is None) == (area is None):
         return {"ok": False, "error": "invalid_params", "message": "Indica 'uids' o 'area' (solo uno)"}
     key = batch_id or f"delete-{uuid.uuid4()}"
@@ -245,6 +278,159 @@ def gd_undo_last_batch() -> dict:
     modificar o borrar). Se pueden deshacer hasta 50 lotes seguidos."""
     # Clave unica: si la conexion falla y se reintenta, no se deshacen dos lotes
     return _safe("undo_last_batch", {}, f"undo-{uuid.uuid4()}")
+
+
+# ---------------------------------------------------------------- fase 5
+
+# IDs comprobados con el catalogo del juego (gd_get_object_catalog):
+# portal_01..18, boost_01..05, ring_*, bump_*.
+GAMEPLAY_IDS = {
+    "block": 1, "spike": 8,
+    "portal_cube": 12, "portal_ship": 13, "portal_ball": 47, "portal_ufo": 111,
+    "portal_wave": 660, "portal_robot": 745, "portal_spider": 1331, "portal_swing": 1933,
+    "gravity_normal": 10, "gravity_flip": 11, "mirror_on": 45, "mirror_off": 46,
+    "size_normal": 99, "size_mini": 101, "dual_on": 286, "dual_off": 287,
+    "speed_0.5x": 200, "speed_1x": 201, "speed_2x": 202, "speed_3x": 203, "speed_4x": 1334,
+    "pad_yellow": 35, "pad_pink": 140, "pad_red": 1332, "pad_blue": 67,
+    "orb_yellow": 36, "orb_pink": 141, "orb_red": 1333, "orb_blue": 84,
+    "orb_green": 1022, "orb_black": 1330, "orb_dash_green": 1704, "orb_dash_pink": 1751,
+}
+GameplayKind = Literal[tuple(GAMEPLAY_IDS)]  # type: ignore[valid-type]
+
+
+class GameplayItem(BaseModel):
+    kind: Annotated[GameplayKind, Field(description="que objeto poner")]
+    x: Annotated[float, Field(ge=-1000, le=1_000_000, description="X del centro; columnas en 15 + 30*n")]
+    y: Annotated[float, Field(ge=-3000, le=30_000, description="Y del centro; 105 = fila del suelo. Portales: unos 135 a ras de suelo")] = 105
+    rotation: Annotated[float, Field(ge=-360, le=360)] = 0
+    flipY: bool = False
+    groups: GroupList | None = None
+
+
+@mcp.tool()
+def gd_place_gameplay_objects(
+    items: Annotated[list[GameplayItem], Field(min_length=1, max_length=MAX_BATCH)],
+    batch_id: str | None = None,
+) -> dict:
+    """Coloca objetos de gameplay por nombre (portales de modo, gravedad,
+    tamano, espejo, dual, velocidad, pads, orbes, bloque, pincho) sin tener
+    que saber su id. Cuadricula: centros en x = 15 + 30*n; fila del suelo
+    y = 105. Se deshace con gd_undo_last_batch."""
+    objects = []
+    for it in items:
+        o = {"id": GAMEPLAY_IDS[it.kind], "x": it.x, "y": it.y, "rotation": it.rotation, "flipY": it.flipY}
+        if it.groups:
+            o["groups"] = it.groups
+        objects.append(o)
+    key = batch_id or f"gameplay-{uuid.uuid4()}"
+    result = _safe("add_objects_batch", {"objects": objects}, key)
+    result.setdefault("batchId", key)
+    return result
+
+
+COLOR_CHANNELS = {"bg": 1000, "ground": 1001, "line": 1002, "obj": 1004, "ground2": 1009}
+# Unidades del move en el texto del nivel por cada bloque. PENDIENTE de
+# confirmar en el juego con la prueba de la Fase 5.
+MOVE_UNITS_PER_BLOCK = 30
+
+
+class TriggerSpec(BaseModel):
+    type: Literal["color", "move", "alpha"]
+    x: Annotated[float, Field(ge=-1000, le=1_000_000, description="se activa cuando el jugador pasa por esta X")]
+    y: Annotated[float, Field(ge=-3000, le=30_000)] = 225
+    duration: Annotated[float, Field(ge=0, le=600)] = 0.5
+    touch_triggered: bool = False
+    spawn_triggered: bool = False
+    multi_trigger: bool = False
+    groups: Annotated[GroupList | None, Field(description="grupos del propio trigger (para triggers spawn)")] = None
+    # color
+    channel: Annotated[int | Literal["bg", "ground", "line", "obj", "ground2"] | None,
+                       Field(description="canal de color: numero 1-999 o bg/ground/line/obj/ground2")] = None
+    r: Annotated[int, Field(ge=0, le=255)] = 255
+    g: Annotated[int, Field(ge=0, le=255)] = 255
+    b: Annotated[int, Field(ge=0, le=255)] = 255
+    blending: bool = False
+    # move / alpha
+    target_group: Annotated[int, Field(ge=1, le=9999)] | None = None
+    move_x_blocks: Annotated[float, Field(ge=-3000, le=3000)] = 0
+    move_y_blocks: Annotated[float, Field(ge=-3000, le=3000)] = 0
+    easing: Annotated[int, Field(ge=0, le=18)] = 0
+    easing_rate: Annotated[float, Field(ge=0.1, le=20)] = 2
+    opacity: Annotated[float, Field(ge=0, le=1)] = 1
+
+
+TRIGGER_IDS = {"color": 899, "move": 901, "alpha": 1007}
+
+
+def _trigger_to_object(t: TriggerSpec) -> dict:
+    props: dict = {"10": t.duration}
+    if t.touch_triggered:
+        props["11"] = True
+    if t.spawn_triggered:
+        props["62"] = True
+    if t.multi_trigger:
+        props["87"] = True
+    if t.type == "color":
+        if t.channel is None:
+            raise ValueError("el trigger de color necesita 'channel'")
+        ch = COLOR_CHANNELS[t.channel] if isinstance(t.channel, str) else t.channel
+        if not 1 <= ch <= 1101:
+            raise ValueError("canal de color fuera de rango")
+        props.update({"23": ch, "7": t.r, "8": t.g, "9": t.b, "35": t.opacity})
+        if t.blending:
+            props["17"] = True
+    else:
+        if t.target_group is None:
+            raise ValueError(f"el trigger {t.type} necesita 'target_group'")
+        props["51"] = t.target_group
+        if t.type == "move":
+            props["28"] = t.move_x_blocks * MOVE_UNITS_PER_BLOCK
+            props["29"] = t.move_y_blocks * MOVE_UNITS_PER_BLOCK
+            props["30"] = t.easing
+            if t.easing:
+                props["85"] = t.easing_rate
+        else:
+            props["35"] = t.opacity
+    obj = {"id": TRIGGER_IDS[t.type], "x": t.x, "y": t.y, "props": props}
+    if t.groups:
+        obj["groups"] = t.groups
+    return obj
+
+
+@mcp.tool()
+def gd_add_triggers(
+    triggers: Annotated[list[TriggerSpec], Field(min_length=1, max_length=200)],
+    batch_id: str | None = None,
+) -> dict:
+    """Crea triggers de color, move y alpha. Color: channel + r,g,b
+    (+opacity, blending). Move: target_group + move_x_blocks/move_y_blocks
+    (+easing). Alpha: target_group + opacity. Para que un objeto se vea
+    afectado, ponle ese grupo con 'groups' al crearlo. La respuesta dice si
+    el juego guardo cada propiedad (propsOk)."""
+    try:
+        objects = [_trigger_to_object(t) for t in triggers]
+    except ValueError as e:
+        return {"ok": False, "error": "invalid_params", "message": str(e)}
+    key = batch_id or f"triggers-{uuid.uuid4()}"
+    result = _safe("add_objects_batch", {"objects": objects}, key)
+    result.setdefault("batchId", key)
+    return result
+
+
+@mcp.tool()
+def gd_get_level_summary() -> dict:
+    """Resumen del nivel abierto: numero de objetos, limites, longitud en
+    bloques, ids mas usados, portales/velocidades/triggers ordenados por X,
+    grupos usados y el siguiente grupo libre. Llamalo antes de construir."""
+    return _safe("get_level_summary")
+
+
+@mcp.tool()
+def gd_save_level(confirm: bool = False) -> dict:
+    """Guarda el nivel abierto (como el boton Save del editor). Antes guarda
+    una copia de la version anterior. Exige confirm=true: pregunta SIEMPRE
+    al usuario antes de guardar y no lo hagas por tu cuenta."""
+    return _safe("save_level", {"confirm": confirm}, f"save-{uuid.uuid4()}")
 
 
 def _check() -> int:
