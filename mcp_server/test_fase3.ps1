@@ -1,73 +1,109 @@
-# Prueba de la Fase 3: catalogo, leer area, modificar, borrar y deshacer.
-# Al final el nivel debe quedar EXACTAMENTE con los objetos que tenia al empezar.
+# Prueba de la Fase 3 (version segura).
+# - Solo trabaja en la zona x 30000..34000; si ahi hay objetos, NO hace nada.
+# - Guarda una foto de TODO el nivel al empezar y al final la compara objeto
+#   por objeto (id, x, y, rotacion, escala, volteo).
 # Resultado en test_fase3_resultado.txt
 
 $ErrorActionPreference = "Stop"
 $out = Join-Path $PSScriptRoot "test_fase3_resultado.txt"
-"=== Prueba Fase 3 $(Get-Date -Format s) ===" | Out-File $out -Encoding utf8
+"=== Prueba Fase 3 (segura) $(Get-Date -Format s) ===" | Out-File $out -Encoding utf8
 function Log($t) { $t | Out-File $out -Append -Encoding utf8; Write-Host $t }
 function J($o) { $o | ConvertTo-Json -Compress -Depth 6 }
 
-try {
-    $bridge = Get-Content (Join-Path $env:LOCALAPPDATA "GeometryDash\geode\mods\grupo.practice-runs\ai-bridge.json") -Raw | ConvertFrom-Json
-    $base = "http://127.0.0.1:$($bridge.port)/api"
-    function Call($tool, $body) {
-        $h = @{ Authorization = "Bearer $($bridge.token)"; "Idempotency-Key" = "$tool-" + [guid]::NewGuid() }
-        try {
-            return Invoke-RestMethod -Method Post -Uri "$base/$tool" -Headers $h -Body (J $body) -ContentType "application/json"
-        } catch {
-            $r = $_.Exception.Response
-            if ($r) { $sr = New-Object IO.StreamReader($r.GetResponseStream()); return ($sr.ReadToEnd() | ConvertFrom-Json) }
-            throw
-        }
+$bridge = Get-Content (Join-Path $env:LOCALAPPDATA "GeometryDash\geode\mods\grupo.practice-runs\ai-bridge.json") -Raw | ConvertFrom-Json
+$base = "http://127.0.0.1:$($bridge.port)/api"
+function Call($tool, $body) {
+    $h = @{ Authorization = "Bearer $($bridge.token)"; "Idempotency-Key" = "$tool-" + [guid]::NewGuid() }
+    try {
+        return Invoke-RestMethod -Method Post -Uri "$base/$tool" -Headers $h -Body (J $body) -ContentType "application/json"
+    } catch {
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) { return ($_.ErrorDetails.Message | ConvertFrom-Json) }
+        throw
     }
+}
+function Snapshot {
+    $all = Call "get_objects_in_area" @{ limit = 2000 }
+    if ($all.truncated) { throw "El nivel tiene mas de 2000 objetos; usa un nivel de prueba mas pequeno" }
+    return ($all.objects | ForEach-Object {
+        "{0}|{1}|{2}|{3}|{4}|{5}|{6}" -f $_.id, $_.x, $_.y, $_.rotation, $_.scale, $_.flipX, $_.flipY
+    } | Sort-Object)
+}
+$fails = 0
+function Check($cond, $text) {
+    if ($cond) { Log "  OK   $text" } else { Log "  FALLO $text"; $script:fails++ }
+}
 
+try {
     $s0 = Call "get_editor_state" @{}
-    Log ("1 estado inicial: " + (J $s0))
     if (-not $s0.inEditor) { Log "Abre un nivel en el editor y repite."; exit 0 }
-    $start = $s0.objectCount
+    Log "Nivel '$($s0.levelName)' con $($s0.objectCount) objetos"
 
-    $cat = Call "get_object_catalog" @{ query = "spike"; limit = 5 }
-    Log ("2 catalogo 'spike': total=$($cat.total) primeros=" + (J $cat.items))
+    $zone = Call "get_objects_in_area" @{ x1 = 29000; x2 = 35000 }
+    if ($zone.total -gt 0) { Log "PARADO: hay $($zone.total) objetos en la zona de pruebas (x 29000-35000). No toco nada."; exit 0 }
 
-    # Zona de pruebas lejos del principio para no tocar nada tuyo: x 3015..3075
+    $before = Snapshot
+    Log "Foto inicial: $($before.Count) objetos"
+
+    # 1) Anadir 3 objetos
     $add = Call "add_objects_batch" @{ objects = @(
-        @{ id = 1; x = 3015; y = 105 }, @{ id = 8; x = 3045; y = 105 }, @{ id = 1; x = 3075; y = 135 }) }
-    Log ("3 anadir: ok=$($add.ok) creados=$($add.created) misplaced=$($add.misplaced)")
-    $uids = $add.objects | ForEach-Object { $_.uid }
+        @{ id = 1; x = 30015; y = 105 }, @{ id = 8; x = 30045; y = 105 }, @{ id = 1; x = 30075; y = 135 }) }
+    Check ($add.ok -and $add.created -eq 3 -and $add.misplaced -eq 0) "anadir 3 objetos"
+    $uids = @($add.objects | ForEach-Object { $_.uid })
 
-    $area = Call "get_objects_in_area" @{ x1 = 3000; x2 = 3090; y1 = 90; y2 = 150 }
-    Log ("4 leer area: total=$($area.total) " + (J ($area.objects | Select-Object uid,id,x,y)))
+    # 2) Leer la zona
+    $area = Call "get_objects_in_area" @{ x1 = 29000; x2 = 35000 }
+    Check ($area.total -eq 3) "leer zona: $($area.total) objetos"
 
-    $mod = Call "modify_objects_batch" @{ changes = @(
-        @{ uid = $uids[1]; dx = 30 },
-        @{ uid = $uids[0]; rotation = 90; scale = 1.5 }) }
-    Log ("5 modificar: ok=$($mod.ok) modificados=$($mod.modified) misplaced=$($mod.misplaced) " + (J ($mod.objects | Select-Object oldUid,uid,x,y,rotation,scale)))
-    $spikeNew = ($mod.objects | Where-Object { $_.oldUid -eq $uids[1] }).uid
+    # 3) Modificar: mover pincho y girar/escalar bloque
+    $mod = Call "modify_objects_batch" @{ changes = @(@{ uid = $uids[1]; dx = 30 }, @{ uid = $uids[0]; rotation = 90; scale = 1.5 }) }
+    Check ($mod.ok -and $mod.modified -eq 2) "modificar 2 objetos"
+    $spike = ($mod.objects | Where-Object { $_.oldUid -eq $uids[1] })
+    Check ($spike.x -eq 30075 -and $spike.y -eq 105) "pincho movido a x=30075"
 
-    $del = Call "delete_objects_batch" @{ uids = @($spikeNew) }
-    Log ("6 borrar pincho: ok=$($del.ok) borrados=$($del.deleted) total=$($del.objectCountAfter)")
+    # 4) Borrar el pincho
+    $del = Call "delete_objects_batch" @{ uids = @($spike.uid) }
+    Check ($del.ok -and $del.deleted -eq 1) "borrar pincho"
 
+    # 5) Deshacer borrado
     $u1 = Call "undo_last_batch" @{}
-    Log ("7 deshacer borrado: ok=$($u1.ok) tipo=$($u1.type) restaurados=$($u1.restored) total=$($u1.objectCountAfter)")
+    Check ($u1.ok -and $u1.type -eq "delete" -and $u1.restored -eq 1) "deshacer borrado"
 
+    # 6) Deshacer modificacion: deben volver los originales y no quedar copias
     $u2 = Call "undo_last_batch" @{}
-    Log ("8 deshacer modificacion: ok=$($u2.ok) tipo=$($u2.type) quitados=$($u2.removed) restaurados=$($u2.restored)")
-    $check = Call "get_objects_in_area" @{ x1 = 3000; x2 = 3090; y1 = 90; y2 = 150 }
-    Log ("   tras deshacer: " + (J ($check.objects | Select-Object id,x,y,rotation,scale)))
+    Check ($u2.ok -and $u2.type -eq "modify" -and $u2.removed -eq 2 -and $u2.restored -eq 2) "deshacer modificacion (quitados=$($u2.removed) restaurados=$($u2.restored))"
+    $z = Call "get_objects_in_area" @{ x1 = 29000; x2 = 35000 }
+    $zs = ($z.objects | ForEach-Object { "{0}@{1},{2} r{3} s{4}" -f $_.id, $_.x, $_.y, $_.rotation, $_.scale } | Sort-Object) -join "; "
+    Check ($z.total -eq 3 -and $zs -eq "1@30015,105 r0 s1; 1@30075,135 r0 s1; 8@30045,105 r0 s1") "zona tras deshacer: $zs"
 
+    # 7) Deshacer anadido
     $u3 = Call "undo_last_batch" @{}
-    Log ("9 deshacer anadido: ok=$($u3.ok) tipo=$($u3.type) quitados=$($u3.removed) total=$($u3.objectCountAfter)")
+    Check ($u3.ok -and $u3.type -eq "add" -and $u3.removed -eq 3) "deshacer anadido (quitados=$($u3.removed))"
 
+    # 8) Borrado grande sin confirmar: crear 101 objetos y pedir borrarlos sin confirm
+    $many = @(); for ($i = 0; $i -lt 101; $i++) { $many += @{ id = 1; x = 31005 + 30 * ($i % 50); y = 105 + 30 * [math]::Floor($i / 50) } }
+    $addMany = Call "add_objects_batch" @{ objects = $many }
+    Check ($addMany.ok -and $addMany.created -eq 101) "anadir 101 objetos"
+    $manyUids = @($addMany.objects | ForEach-Object { $_.uid })
+    $noConfirm = Call "delete_objects_batch" @{ uids = $manyUids }
+    Check ($noConfirm.error -eq "confirmation_required") "borrar 101 sin confirmar -> rechazado ($($noConfirm.error))"
+    $withConfirm = Call "delete_objects_batch" @{ uids = $manyUids; confirm = $true }
+    Check ($withConfirm.ok -and $withConfirm.deleted -eq 101) "borrar 101 con confirm=true"
     $u4 = Call "undo_last_batch" @{}
-    Log ("10 deshacer sin nada (debe fallar): error=$($u4.error)")
+    Check ($u4.ok -and $u4.restored -eq 101) "deshacer borrado de 101"
+    $u5 = Call "undo_last_batch" @{}
+    Check ($u5.ok -and $u5.type -eq "add" -and $u5.removed -eq 101) "deshacer anadido de 101 (quitados=$($u5.removed))"
 
-    $big = Call "delete_objects_batch" @{ area = @{ x1 = -1e9; x2 = 1e9; y1 = -1e9; y2 = 1e9 } }
-    Log ("11 borrado masivo sin confirmar: error=$($big.error) deleted=$($big.deleted)")
+    # 9) Historial vacio
+    $u6 = Call "undo_last_batch" @{}
+    Check ($u6.error -eq "nothing_to_undo") "historial vacio -> $($u6.error)"
 
-    $s1 = Call "get_editor_state" @{}
-    if ($s1.objectCount -eq $start) { Log "RESULTADO: OK, el nivel ha vuelto a $start objetos" }
-    else { Log "RESULTADO: FALLO, empezo con $start y acaba con $($s1.objectCount)" }
+    # 10) Comparar el nivel completo con la foto inicial
+    $after = Snapshot
+    $diff = Compare-Object $before $after
+    Check ($null -eq $diff) "nivel identico al inicial ($($before.Count) -> $($after.Count) objetos)"
+    if ($diff) { Log ("  diferencias: " + (J $diff)) }
+
+    if ($fails -eq 0) { Log "RESULTADO: TODO OK" } else { Log "RESULTADO: $fails FALLOS" }
     Log "=== FIN ==="
 } catch {
     Log ("ERROR: " + $_.Exception.Message)
