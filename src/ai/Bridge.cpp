@@ -31,7 +31,7 @@ using namespace geode::prelude;
 
 namespace {
     constexpr int kMaxBatch = 1000;
-    constexpr char const* kBridgeVersion = "0.4.0";
+    constexpr char const* kBridgeVersion = "0.4.1";
 
     // ---------------- respuestas ----------------
 
@@ -1018,6 +1018,19 @@ namespace {
         return res;
     }
 }
+
+// Cada vez que se abre el editor empieza un historial nuevo. Comparar solo el
+// puntero no basta: un editor nuevo puede reutilizar la misma direccion de
+// memoria (visto en la Fase 6: tras salir y volver a entrar, el historial
+// viejo seguia ahi y apuntaba a objetos que ya no existian).
+#include <Geode/modify/LevelEditorLayer.hpp>
+class $modify(AIHistoryResetEditor, LevelEditorLayer) {
+    bool init(GJGameLevel* level, bool noUI) {
+        g_history.clear();
+        g_historyEditor = nullptr;
+        return LevelEditorLayer::init(level, noUI);
+    }
+};
 
 $on_mod(Loaded) {
     if (!Mod::get()->getSettingValue<bool>("ai-builder")) {
