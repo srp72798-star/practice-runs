@@ -17,9 +17,12 @@
 #include <Geode/modify/PlayerObject.hpp>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdio>
+#include <map>
 #include <optional>
+#include <sstream>
 #include <vector>
 
 using namespace geode::prelude;
@@ -125,6 +128,14 @@ static float speedValueOf(Speed speed) {
     }
 }
 
+static Speed speedEnumOf(float value) {
+    if (value < 0.8f)  return Speed::Slow;
+    if (value < 1.0f)  return Speed::Normal;
+    if (value < 1.2f)  return Speed::Fast;
+    if (value < 1.45f) return Speed::Faster;
+    return Speed::Fastest;
+}
+
 // Para cada tipo de portal guarda el ultimo (el de mayor X) antes del punto
 struct Latest {
     float x = -1e9f;
@@ -134,7 +145,99 @@ struct Latest {
     }
 };
 
+static std::optional<float> detectPathY(PlayLayer* pl, float x);
+
+// ------------------------------------------------------------
+// Velocidad aprendida jugando: cada vez que el jugador cambia de velocidad
+// de verdad (al cruzar un portal) se apunta la X y la velocidad, por nivel.
+// Asi se sabe la velocidad real del camino, aunque haya portales trampa o
+// de rutas secretas por los que no se pasa.
+// ------------------------------------------------------------
+
+struct SpeedTrack {
+    std::map<int, float> points;  // X redondeada -> velocidad
+    float maxX = 0.f;             // hasta donde se ha jugado de verdad
+    bool dirty = false;
+};
+
+static std::map<std::string, SpeedTrack> g_tracks;
+static bool g_applyingSpeed = false;  // true mientras el mod pone la velocidad
+
+static std::string trackKey(PlayLayer* pl) {
+    if (!pl || !pl->m_level) return "";
+    return fmt::format("speeds-{}-{}", static_cast<int>(pl->m_level->m_levelType),
+        pl->m_level->m_levelID.value());
+}
+
+static SpeedTrack& loadTrack(std::string const& key) {
+    auto it = g_tracks.find(key);
+    if (it != g_tracks.end()) return it->second;
+
+    SpeedTrack track;
+    // Formato: "maxX|x:v,x:v,..."
+    auto saved = Mod::get()->getSavedValue<std::string>(key, "");
+    auto bar = saved.find('|');
+    if (bar != std::string::npos) {
+        track.maxX = std::strtof(saved.substr(0, bar).c_str(), nullptr);
+        std::istringstream rest(saved.substr(bar + 1));
+        std::string item;
+        while (std::getline(rest, item, ',')) {
+            int x = 0;
+            float v = 0.f;
+            if (std::sscanf(item.c_str(), "%d:%f", &x, &v) == 2) track.points[x] = v;
+        }
+    }
+    return g_tracks.emplace(key, std::move(track)).first->second;
+}
+
+static void saveTrack(std::string const& key) {
+    auto it = g_tracks.find(key);
+    if (it == g_tracks.end() || !it->second.dirty) return;
+    std::string out = fmt::format("{}|", it->second.maxX);
+    bool first = true;
+    for (auto const& [x, v] : it->second.points) {
+        if (!first) out += ",";
+        out += fmt::format("{}:{}", x, v);
+        first = false;
+    }
+    Mod::get()->setSavedValue<std::string>(key, out);
+    it->second.dirty = false;
+}
+
+// Solo se aprende jugando normal: sin tramo activo y sin StartPos
+static bool canRecord(PlayLayer* pl) {
+    return pl && g_run.state == RunState::Idle && !pl->m_startPosObject;
+}
+
+// Velocidad aprendida en una X, si ya se ha jugado hasta ahi
+static std::optional<float> learnedSpeedAt(PlayLayer* pl, float x) {
+    auto key = trackKey(pl);
+    if (key.empty()) return std::nullopt;
+    auto& track = loadTrack(key);
+    if (track.points.empty() || track.maxX < x) return std::nullopt;
+    auto it = track.points.upper_bound(static_cast<int>(std::round(x)));
+    if (it == track.points.begin()) return std::nullopt;
+    --it;
+    return it->second;
+}
+
+static LevelStateAt computeLevelStateAt(PlayLayer* pl, float targetX);
+
+// Igual que computeLevelStateAt pero recuerda el ultimo resultado, porque al
+// reaparecer se pide muchas veces para la misma X y recorrer el nivel es lento
 static LevelStateAt levelStateAt(PlayLayer* pl, float targetX) {
+    static PlayLayer* cachedLayer = nullptr;
+    static int cachedX = INT_MIN;
+    static LevelStateAt cached;
+    int x = static_cast<int>(std::round(targetX));
+    if (pl == cachedLayer && x == cachedX) return cached;
+    cached = computeLevelStateAt(pl, targetX);
+    cachedLayer = pl;
+    cachedX = x;
+    return cached;
+}
+
+static LevelStateAt computeLevelStateAt(PlayLayer* pl, float targetX) {
     LevelStateAt st;
     if (auto ls = pl->m_levelSettings) {
         st.mode = ls->m_startMode;
@@ -147,6 +250,7 @@ static LevelStateAt levelStateAt(PlayLayer* pl, float targetX) {
 
     Latest mode, speed, gravity, size, dual, mirror, warp;
     float warpValue = 1.f;
+    std::vector<GameObject*> speedPortals;
     for (auto obj : CCArrayExt<GameObject*>(pl->m_objects)) {
         float ox = obj->getPositionX();
         if (ox > targetX) continue;
@@ -165,9 +269,9 @@ static LevelStateAt levelStateAt(PlayLayer* pl, float targetX) {
             // Portales de modo
             case 12: case 13: case 47: case 111: case 660: case 745: case 1331: case 1933:
                 mode.consider(ox, id); break;
-            // Portales de velocidad
+            // Portales de velocidad: se guardan todos y se filtran despues
             case 200: case 201: case 202: case 203: case 1334:
-                speed.consider(ox, id); break;
+                speedPortals.push_back(obj); break;
             // Gravedad: azul normal, amarillo invertida
             case 10: case 11:
                 gravity.consider(ox, id); break;
@@ -195,6 +299,21 @@ static LevelStateAt levelStateAt(PlayLayer* pl, float targetX) {
         case 1933: st.mode = 7; break;
         default: break;
     }
+    // Portales de velocidad: ignorar los que estan lejos del camino (rutas
+    // secretas, decoracion...). El camino se mide con los objetos jugables
+    // cerca de cada portal.
+    for (auto obj : speedPortals) {
+        float ox = obj->getPositionX();
+        if (ox <= speed.x) continue;
+        auto pathY = detectPathY(pl, ox);
+        if (pathY && std::abs(obj->getPositionY() - *pathY) > 300.f) {
+            log::info("Portal de velocidad id {} en X={} Y={} ignorado (camino a Y={})",
+                obj->m_objectID, ox, obj->getPositionY(), *pathY);
+            continue;
+        }
+        speed.consider(ox, obj->m_objectID);
+    }
+
     switch (speed.id) {
         case 200:  st.speed = Speed::Slow; break;
         case 201:  st.speed = Speed::Normal; break;
@@ -212,6 +331,13 @@ static LevelStateAt levelStateAt(PlayLayer* pl, float targetX) {
     st.timeWarp = warpValue > 0.f ? warpValue : 1.f;
     st.speedPortalX = speed.x;
     st.speedPortalId = speed.id;
+
+    // Si ya se ha jugado hasta aqui, manda la velocidad real aprendida
+    if (auto learned = learnedSpeedAt(pl, targetX)) {
+        st.speedValue = *learned;
+        st.speed = speedEnumOf(*learned);
+        st.speedPortalId = 0;  // 0 = velocidad aprendida jugando
+    }
     return st;
 }
 
@@ -318,10 +444,12 @@ static void fixPlayerSpeed(PlayLayer* pl, char const* when) {
     float before = pl->m_player1->m_playerSpeed;
     float warpBefore = pl->m_gameState.m_timeWarp;
 
+    g_applyingSpeed = true;
     pl->m_player1->updateTimeMod(st.speedValue, true);
     if (pl->m_player2 && pl->m_player2->isVisible()) {
         pl->m_player2->updateTimeMod(st.speedValue, true);
     }
+    g_applyingSpeed = false;
     if (std::abs(pl->m_gameState.m_timeWarp - st.timeWarp) > 0.001f) {
         pl->updateTimeWarp(st.timeWarp);
     }
@@ -640,6 +768,24 @@ class $modify(PRPlayerObject, PlayerObject) {
         if (checkpointsBlocked()) return;
         PlayerObject::tryPlaceCheckpoint();
     }
+
+    // Aprender la velocidad real: cada cambio de velocidad del jugador 1
+    // jugando normal se apunta con su X
+    void updateTimeMod(float speed, bool noEffects) {
+        PlayerObject::updateTimeMod(speed, noEffects);
+        if (g_applyingSpeed) return;
+        auto pl = PlayLayer::get();
+        if (!pl || this != pl->m_player1 || !canRecord(pl)) return;
+        auto key = trackKey(pl);
+        if (key.empty()) return;
+        auto& track = loadTrack(key);
+        int x = static_cast<int>(std::round(this->getPositionX()));
+        auto it = track.points.find(x);
+        if (it == track.points.end() || std::abs(it->second - speed) > 0.001f) {
+            track.points[x] = speed;
+            track.dirty = true;
+        }
+    }
 };
 
 class $modify(PRPlayLayer, PlayLayer) {
@@ -672,6 +818,24 @@ class $modify(PRPlayLayer, PlayLayer) {
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
 
+        // Apuntar hasta donde se ha jugado de verdad (para fiarse de lo aprendido)
+        if (canRecord(this) && m_player1 && !m_player1->m_isDead) {
+            auto key = trackKey(this);
+            if (!key.empty()) {
+                auto& track = loadTrack(key);
+                float x = m_player1->getPositionX();
+                // Velocidad con la que empieza el nivel
+                if (track.points.empty()) {
+                    track.points[static_cast<int>(std::round(x))] = m_player1->m_playerSpeed;
+                    track.dirty = true;
+                }
+                if (x > track.maxX) {
+                    track.maxX = x;
+                    track.dirty = true;
+                }
+            }
+        }
+
         if (g_run.syncFrames > 0 && --g_run.syncFrames == 0 && g_run.state == RunState::Running) {
             this->syncMusic();
         }
@@ -698,7 +862,13 @@ class $modify(PRPlayLayer, PlayLayer) {
         PlayLayer::togglePracticeMode(practiceMode);
     }
 
+    void levelComplete() {
+        saveTrack(trackKey(this));
+        PlayLayer::levelComplete();
+    }
+
     void onQuit() {
+        saveTrack(trackKey(this));
         resetRun();
         clearStartPos(this);
         PlatformToolbox::showCursor();
