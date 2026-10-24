@@ -31,7 +31,7 @@ using namespace geode::prelude;
 
 namespace {
     constexpr int kMaxBatch = 1000;
-    constexpr char const* kBridgeVersion = "0.5.0";
+    constexpr char const* kBridgeVersion = "0.6.0";
 
     // ---------------- respuestas ----------------
 
@@ -175,7 +175,30 @@ namespace {
         {"181", 0, 60, 'f'}, {"182", 0, 60, 'f'},                     // shader: fade in / fade out
         {"183", 0, 10000, 'f'}, {"191", 0, 10000, 'f'},               // shader: inner / outer
         {"184", 0, 1, 'b'}, {"188", 0, 1, 'b'}, {"190", 0, 1, 'b'},   // shader: invert / useX / useY
+        {"56", 0, 1, 'b'},                                            // toggle: activar grupo
+        {"58", 0, 1, 'b'}, {"59", 0, 1, 'b'},                         // move: seguir al jugador en X / Y
+        {"143", -10, 10, 'f'}, {"144", -10, 10, 'f'},                 // move: multiplicador X / Y al seguir
     };
+
+    // Base64 "url-safe" (el que usa GD para el texto de los objetos de texto, clave 31)
+    std::string base64UrlEncode(std::string const& in) {
+        static constexpr char kChars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        std::string out;
+        size_t i = 0;
+        while (i + 2 < in.size()) {
+            unsigned v = (unsigned char)in[i] << 16 | (unsigned char)in[i + 1] << 8 | (unsigned char)in[i + 2];
+            out += kChars[v >> 18 & 63]; out += kChars[v >> 12 & 63]; out += kChars[v >> 6 & 63]; out += kChars[v & 63];
+            i += 3;
+        }
+        if (i + 1 == in.size()) {
+            unsigned v = (unsigned char)in[i] << 16;
+            out += kChars[v >> 18 & 63]; out += kChars[v >> 12 & 63]; out += "==";
+        } else if (i + 2 == in.size()) {
+            unsigned v = (unsigned char)in[i] << 16 | (unsigned char)in[i + 1] << 8;
+            out += kChars[v >> 18 & 63]; out += kChars[v >> 12 & 63]; out += kChars[v >> 6 & 63]; out += "=";
+        }
+        return out;
+    }
 
     PropRule const* findPropRule(std::string const& key) {
         for (auto const& r : kPropRules) if (key == r.key) return &r;
@@ -203,6 +226,16 @@ namespace {
             std::string joined;
             for (int id : unique) joined += (joined.empty() ? "" : ".") + std::to_string(id);
             out.emplace_back("57", joined);
+        }
+        if (o.contains("text")) {
+            auto text = o["text"].asString();
+            if (!text) return std::string("'text' debe ser texto");
+            auto const& t = text.unwrap();
+            if (t.empty() || t.size() > 80) return std::string("'text' debe tener entre 1 y 80 caracteres");
+            for (char ch : t) {
+                if (ch < 32 || ch > 126) return std::string("'text' solo admite letras, numeros y signos basicos (sin acentos)");
+            }
+            out.emplace_back("31", base64UrlEncode(t));
         }
         if (o.contains("props")) {
             auto const& p = o["props"];
@@ -423,6 +456,7 @@ namespace {
             }
             bool same;
             if (key == "57") same = parseGroupList(it->second) == parseGroupList(want);
+            else if (key == "31") same = it->second == want;
             else {
                 double a = std::atof(it->second.c_str()), b = std::atof(want.c_str());
                 same = std::abs(a - b) <= 0.01 + std::abs(b) * 0.001;
