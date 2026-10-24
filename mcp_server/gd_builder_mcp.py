@@ -247,5 +247,21 @@ def gd_undo_last_batch() -> dict:
     return _safe("undo_last_batch", {}, f"undo-{uuid.uuid4()}")
 
 
+def _check() -> int:
+    """Comprobacion para el instalador: dependencias + conexion con el mod."""
+    import sys
+    print(f"Python {sys.version.split()[0]} OK, SDK mcp OK")
+    print(f"Fichero del puente: {BRIDGE_FILE}")
+    try:
+        state = _call("get_editor_state")
+        print("Conexion con el mod OK:", json.dumps(state, ensure_ascii=False))
+    except BridgeError as e:
+        print("Aviso (no es grave si el juego esta cerrado):", e)
+    return 0
+
+
 if __name__ == "__main__":
+    import sys
+    if "--check" in sys.argv:
+        raise SystemExit(_check())
     mcp.run()

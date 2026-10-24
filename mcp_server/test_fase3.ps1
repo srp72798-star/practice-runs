@@ -41,7 +41,7 @@ try {
     $zone = Call "get_objects_in_area" @{ x1 = 29000; x2 = 35000 }
     if ($zone.total -gt 0) { Log "PARADO: hay $($zone.total) objetos en la zona de pruebas (x 29000-35000). No toco nada."; exit 0 }
 
-    $before = Snapshot
+    $before = @(Snapshot)
     Log "Foto inicial: $($before.Count) objetos"
 
     # 1) Anadir 3 objetos
@@ -98,10 +98,13 @@ try {
     Check ($u6.error -eq "nothing_to_undo") "historial vacio -> $($u6.error)"
 
     # 10) Comparar el nivel completo con la foto inicial
-    $after = Snapshot
-    $diff = Compare-Object $before $after
-    Check ($null -eq $diff) "nivel identico al inicial ($($before.Count) -> $($after.Count) objetos)"
-    if ($diff) { Log ("  diferencias: " + (J $diff)) }
+    $after = @(Snapshot)
+    $same = (($before -join "`n") -eq ($after -join "`n"))
+    Check $same "nivel identico al inicial ($($before.Count) -> $($after.Count) objetos)"
+    if (-not $same) {
+        $gone = @($before | Where-Object { $after -notcontains $_ }); $extra = @($after | Where-Object { $before -notcontains $_ })
+        Log ("  faltan: " + ($gone -join "; ")); Log ("  sobran: " + ($extra -join "; "))
+    }
 
     if ($fails -eq 0) { Log "RESULTADO: TODO OK" } else { Log "RESULTADO: $fails FALLOS" }
     Log "=== FIN ==="
