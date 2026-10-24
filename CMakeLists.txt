@@ -21,4 +21,16 @@ endif()
 
 add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
 
+# Servidor HTTP local para el AI Level Builder (solo cabecera)
+CPMAddPackage(
+    NAME httplib
+    GITHUB_REPOSITORY yhirose/cpp-httplib
+    GIT_TAG v0.18.7
+    DOWNLOAD_ONLY YES
+)
+target_include_directories(${PROJECT_NAME} PRIVATE ${httplib_SOURCE_DIR})
+if (WIN32)
+    target_link_libraries(${PROJECT_NAME} ws2_32)
+endif()
+
 setup_geode_mod(${PROJECT_NAME})

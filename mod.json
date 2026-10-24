@@ -5,7 +5,7 @@
 	},
 	"id": "grupo.practice-runs",
 	"name": "Practice Runs",
-	"version": "v1.3.0",
+	"version": "v1.4.0",
 	"developer": "Grupo",
 	"description": "Practica tramos de un nivel (ej. 65-90) y musica normal en modo practica.",
 	"dependencies": {
@@ -23,6 +23,22 @@
 			"name": "Desbloquear demons de RobTop",
 			"description": "Clubstep, Theory of Everything 2 y Deadlocked no piden monedas.",
 			"default": true
+		},
+		"ai-builder": {
+			"type": "bool",
+			"name": "AI Level Builder (experimental)",
+			"description": "Abre un servidor local (solo 127.0.0.1, con token) para que Claude pueda construir niveles en el editor. Requiere reiniciar el juego.",
+			"default": false,
+			"requires-restart": true
+		},
+		"ai-port": {
+			"type": "int",
+			"name": "Puerto del AI Level Builder",
+			"description": "Puerto local del servidor. Requiere reiniciar el juego.",
+			"default": 47823,
+			"min": 1024,
+			"max": 65535,
+			"requires-restart": true
 		}
 	}
 }
