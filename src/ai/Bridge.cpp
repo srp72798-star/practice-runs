@@ -20,6 +20,10 @@
 #include <random>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <ctime>
+#include <filesystem>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -27,7 +31,7 @@ using namespace geode::prelude;
 
 namespace {
     constexpr int kMaxBatch = 1000;
-    constexpr char const* kBridgeVersion = "0.3.1";
+    constexpr char const* kBridgeVersion = "0.4.0";
 
     // ---------------- respuestas ----------------
 
@@ -137,11 +141,80 @@ namespace {
         }));
     }
 
+    // Propiedades de objeto que la IA puede poner (clave del formato del
+    // nivel). Las claves de triggers salen de los comentarios "property N"
+    // de los bindings de Geode (EffectGameObject / GameObject); 7/8/9 (RGB del
+    // trigger de color) se comprueban al releer el objeto del juego.
+    struct PropRule { char const* key; double min; double max; char kind; }; // kind: i=entero, f=decimal, b=bool
+    constexpr PropRule kPropRules[] = {
+        {"7", 0, 255, 'i'}, {"8", 0, 255, 'i'}, {"9", 0, 255, 'i'},   // color del trigger de color
+        {"10", 0, 600, 'f'},                                          // duracion
+        {"11", 0, 1, 'b'},                                            // touch triggered
+        {"17", 0, 1, 'b'},                                            // blending
+        {"21", 0, 1101, 'i'}, {"22", 0, 1101, 'i'},                   // canal de color principal / detalle
+        {"23", 1, 1101, 'i'},                                         // canal de color objetivo
+        {"28", -100000, 100000, 'f'}, {"29", -100000, 100000, 'f'},   // desplazamiento del move
+        {"30", 0, 18, 'i'},                                           // easing
+        {"35", 0, 1, 'f'},                                            // opacidad
+        {"51", 1, 9999, 'i'},                                         // grupo objetivo
+        {"62", 0, 1, 'b'},                                            // spawn triggered
+        {"85", 0.1, 20, 'f'},                                         // easing rate
+        {"87", 0, 1, 'b'},                                            // multi trigger
+    };
+
+    PropRule const* findPropRule(std::string const& key) {
+        for (auto const& r : kPropRules) if (key == r.key) return &r;
+        return nullptr;
+    }
+
+    using KeyValueList = std::vector<std::pair<std::string, std::string>>;
+
+    // "groups": [1, 2] y "props": {"10": 0.5, ...} -> pares clave/valor ya
+    // validados. Grupos en la clave 57 ("1.2").
+    std::optional<std::string> parseExtras(matjson::Value const& o, KeyValueList& out, bool& groupsGiven) {
+        groupsGiven = false;
+        if (o.contains("groups")) {
+            groupsGiven = true;
+            auto const& g = o["groups"];
+            if (!g.isArray()) return std::string("'groups' debe ser una lista de numeros");
+            auto const& items = g.asArray().unwrap();
+            if (items.size() > 10) return std::string("Maximo 10 grupos por objeto");
+            std::set<int> unique;
+            for (auto const& item : items) {
+                auto v = item.asInt();
+                if (!v || v.unwrap() < 1 || v.unwrap() > 9999) return std::string("Los grupos van de 1 a 9999");
+                unique.insert(static_cast<int>(v.unwrap()));
+            }
+            std::string joined;
+            for (int id : unique) joined += (joined.empty() ? "" : ".") + std::to_string(id);
+            out.emplace_back("57", joined);
+        }
+        if (o.contains("props")) {
+            auto const& p = o["props"];
+            if (!p.isObject()) return std::string("'props' debe ser un objeto {clave: valor}");
+            for (auto const& [key, value] : p) {
+                auto rule = findPropRule(key);
+                if (!rule) return fmt::format("La propiedad '{}' no esta permitida", key);
+                double v;
+                if (value.isBool()) v = value.asBool().unwrap() ? 1 : 0;
+                else if (auto d = value.asDouble()) v = d.unwrap();
+                else return fmt::format("La propiedad '{}' necesita un numero", key);
+                if (v < rule->min || v > rule->max) {
+                    return fmt::format("La propiedad '{}' va de {} a {}", key, rule->min, rule->max);
+                }
+                if (rule->kind != 'f' && v != std::floor(v)) return fmt::format("La propiedad '{}' debe ser entera", key);
+                out.emplace_back(key, numberToString(v));
+            }
+        }
+        return std::nullopt;
+    }
+
     struct ObjectSpec {
         int id = 0;
         double x = 0, y = 0;
         double rotation = 0, scale = 1;
         bool flipX = false, flipY = false;
+        KeyValueList extra;  // grupos y propiedades validados
     };
 
     // Valida y convierte la lista de objetos del JSON. Devuelve el error en
@@ -174,6 +247,8 @@ namespace {
             if (s.y < -3000 || s.y > 30000) return fmt::format("objects[{}]: y fuera de rango", i);
             if (s.rotation < -360 || s.rotation > 360) return fmt::format("objects[{}]: rotation fuera de rango", i);
             if (s.scale < 0.1 || s.scale > 10) return fmt::format("objects[{}]: scale fuera de rango (0.1-10)", i);
+            bool groupsGiven = false;
+            if (auto err = parseExtras(o, s.extra, groupsGiven)) return fmt::format("objects[{}]: {}", i, *err);
             out.push_back(s);
         }
         return std::nullopt;
@@ -193,6 +268,10 @@ namespace {
             if (s.flipY) out += ",5,1";
             if (s.rotation != 0) out += ",6," + numberToString(s.rotation);
             if (s.scale != 1) out += ",128," + numberToString(s.scale) + ",129," + numberToString(s.scale);
+            for (auto const& [k, v] : s.extra) {
+                if (k == "57" && v.empty()) continue;
+                out += "," + k + "," + v;
+            }
             out += ";";
         }
         return out;
@@ -293,6 +372,62 @@ namespace {
         return map;
     }
 
+    std::set<int> parseGroupList(std::string const& v) {
+        std::set<int> out;
+        size_t pos = 0;
+        while (pos <= v.size()) {
+            auto dot = v.find('.', pos);
+            auto part = v.substr(pos, dot == std::string::npos ? std::string::npos : dot - pos);
+            if (!part.empty()) out.insert(std::atoi(part.c_str()));
+            if (dot == std::string::npos) break;
+            pos = dot + 1;
+        }
+        return out;
+    }
+
+    // Relee el objeto tal como lo guarda el juego y compara las propiedades
+    // pedidas. "wrong" = el juego tiene otro valor; "absent" = el juego no la
+    // escribe (suele pasar con valores por defecto).
+    void verifyExtras(GameObject* obj, LevelEditorLayer* editor, KeyValueList const& extra,
+                      std::vector<std::string>& wrong, std::vector<std::string>& absent) {
+        if (extra.empty()) return;
+        auto kv = splitObjectString(std::string(obj->getSaveString(editor).c_str()));
+        for (auto const& [key, want] : extra) {
+            auto it = std::find_if(kv.begin(), kv.end(), [&](auto const& p) { return p.first == key; });
+            if (it == kv.end()) {
+                bool emptyish = want.empty() || want == "0";
+                if (!emptyish) absent.push_back(key);
+                continue;
+            }
+            bool same;
+            if (key == "57") same = parseGroupList(it->second) == parseGroupList(want);
+            else {
+                double a = std::atof(it->second.c_str()), b = std::atof(want.c_str());
+                same = std::abs(a - b) <= 0.01 + std::abs(b) * 0.001;
+            }
+            if (!same) wrong.push_back(fmt::format("{}: pedido {} / juego {}", key, want, it->second));
+        }
+    }
+
+    matjson::Value stringList(std::vector<std::string> const& v) {
+        auto arr = matjson::Value::array();
+        for (auto const& s : v) arr.push(s);
+        return arr;
+    }
+
+    // Grupos y propiedades permitidas tal como las guarda el juego
+    void addDetails(matjson::Value& d, GameObject* obj, LevelEditorLayer* editor) {
+        auto kv = splitObjectString(std::string(obj->getSaveString(editor).c_str()));
+        auto groups = matjson::Value::array();
+        auto props = matjson::Value::object();
+        for (auto const& [k, v] : kv) {
+            if (k == "57") { for (int g : parseGroupList(v)) groups.push(g); }
+            else if (findPropRule(k)) props[k] = std::atof(v.c_str());
+        }
+        d["groups"] = groups;
+        d["props"] = props;
+    }
+
     void deselectAll(LevelEditorLayer* editor) {
         if (editor->m_editorUI) editor->m_editorUI->deselectAll();
     }
@@ -358,6 +493,8 @@ namespace {
         int limit = static_cast<int>(std::clamp<std::intmax_t>(body["limit"].asInt().unwrapOr(500), 1, 2000));
         std::optional<int> idFilter;
         if (body.contains("id")) idFilter = static_cast<int>(body["id"].asInt().unwrapOr(-1));
+        bool details = body["details"].asBool().unwrapOr(false);
+        if (details) limit = std::min(limit, 500);
 
         auto list = matjson::Value::array();
         int matched = 0;
@@ -365,7 +502,11 @@ namespace {
             float x = obj->getPositionX(), y = obj->getPositionY();
             if (x < x1 || x > x2 || y < y1 || y > y2) continue;
             if (idFilter && obj->m_objectID != *idFilter) continue;
-            if (matched < limit) list.push(describe(obj));
+            if (matched < limit) {
+                auto d = describe(obj);
+                if (details) addDetails(d, obj, editor);
+                list.push(d);
+            }
             matched++;
         }
         return reply(matjson::makeObject({
@@ -387,7 +528,7 @@ namespace {
         auto byUid = objectsByUid(editor);
 
         // 1) Validar TODO antes de tocar nada
-        struct Plan { GameObject* obj; std::string original; std::string modified; double x, y; };
+        struct Plan { GameObject* obj; std::string original; std::string modified; double x, y; KeyValueList extra; };
         std::vector<Plan> plans;
         std::unordered_set<int> seen;
         for (size_t i = 0; i < changes.size(); i++) {
@@ -427,7 +568,14 @@ namespace {
             }
             if (c.contains("flipX")) setKey(kv, "4", c["flipX"].asBool().unwrapOr(false) ? "1" : "0");
             if (c.contains("flipY")) setKey(kv, "5", c["flipY"].asBool().unwrapOr(false) ? "1" : "0");
-            plans.push_back({obj, original, joinObjectString(kv), x, y});
+            KeyValueList extra;
+            bool groupsGiven = false;
+            if (auto err = parseExtras(c, extra, groupsGiven)) return fail("invalid_params", fmt::format("changes[{}]: {}", i, *err));
+            for (auto const& [k, v] : extra) {
+                if (k == "57" && v.empty()) removeKey(kv, "57");   // groups: [] quita todos los grupos
+                else setKey(kv, k, v);
+            }
+            plans.push_back({obj, original, joinObjectString(kv), x, y, extra});
         }
 
         // 2) Aplicar: quitar el original y crear la version modificada
@@ -453,16 +601,24 @@ namespace {
         // 3) Verificar (y que los lotes anteriores apunten a los objetos nuevos)
         auto& history = historyFor(editor);
         auto list = matjson::Value::array();
-        int misplaced = 0;
+        int misplaced = 0, propsWrong = 0;
         size_t i = 0;
         for (auto obj : CCArrayExt<GameObject*>(created)) {
             entry.created.emplace_back(obj);
             remapHistory(history, plans[i].obj, obj);
             bool ok = std::abs(obj->getPositionX() - plans[i].x) < 0.5 && std::abs(obj->getPositionY() - plans[i].y) < 0.5;
             if (!ok) misplaced++;
+            std::vector<std::string> wrong, absent;
+            verifyExtras(obj, editor, plans[i].extra, wrong, absent);
+            if (!wrong.empty()) propsWrong++;
             auto d = describe(obj);
             d["oldUid"] = plans[i].obj->m_uniqueID;
             d["positionOk"] = ok;
+            if (!plans[i].extra.empty()) {
+                d["propsOk"] = wrong.empty();
+                if (!wrong.empty()) d["propsWrong"] = stringList(wrong);
+                if (!absent.empty()) d["propsNotSaved"] = stringList(absent);
+            }
             list.push(d);
             i++;
         }
@@ -470,9 +626,10 @@ namespace {
         log::info("[AI] Modificados {} objetos (lote {})", plans.size(), batchId);
 
         return reply(matjson::makeObject({
-            {"ok", misplaced == 0},
+            {"ok", misplaced == 0 && propsWrong == 0},
             {"modified", static_cast<int>(plans.size())},
             {"misplaced", misplaced},
+            {"propsWrong", propsWrong},
             {"note", "Los objetos modificados tienen uid nuevo (ver oldUid -> uid)"},
             {"objects", list},
         }));
@@ -620,6 +777,7 @@ namespace {
         auto list = matjson::Value::array();
         int inLevel = 0;
         int misplaced = 0;
+        int propsWrong = 0;
         size_t index = 0;
         for (auto obj : CCArrayExt<GameObject*>(created)) {
             bool present = editor->m_objects->containsObject(obj);
@@ -630,14 +788,23 @@ namespace {
                          std::abs(obj->getPositionY() - specs[index].y) < 0.5;
             }
             if (!placed) misplaced++;
-            list.push(matjson::makeObject({
+            auto d = matjson::makeObject({
                 {"uid", obj->m_uniqueID},
                 {"id", obj->m_objectID},
                 {"x", obj->getPositionX()},
                 {"y", obj->getPositionY()},
                 {"inLevel", present},
                 {"positionOk", placed},
-            }));
+            });
+            if (index < specs.size() && !specs[index].extra.empty()) {
+                std::vector<std::string> wrong, absent;
+                verifyExtras(obj, editor, specs[index].extra, wrong, absent);
+                if (!wrong.empty()) propsWrong++;
+                d["propsOk"] = wrong.empty();
+                if (!wrong.empty()) d["propsWrong"] = stringList(wrong);
+                if (!absent.empty()) d["propsNotSaved"] = stringList(absent);
+            }
+            list.push(d);
             index++;
         }
         int after = static_cast<int>(editor->m_objects->count());
@@ -646,14 +813,158 @@ namespace {
             specs.size(), created->count(), inLevel, before, after);
 
         return reply(matjson::makeObject({
-            {"ok", inLevel == static_cast<int>(specs.size()) && misplaced == 0},
+            {"ok", inLevel == static_cast<int>(specs.size()) && misplaced == 0 && propsWrong == 0},
             {"requested", static_cast<int>(specs.size())},
+            {"propsWrong", propsWrong},
             {"created", static_cast<int>(created->count())},
             {"verifiedInLevel", inLevel},
             {"misplaced", misplaced},
             {"objectCountBefore", before},
             {"objectCountAfter", after},
             {"objects", list},
+        }));
+    }
+
+    // ---------------- resumen del nivel ----------------
+    // IDs comprobados con el catalogo del juego (portal_NN / boost_NN /
+    // edit_e*Btn). Solo sirven para poner nombre en el resumen.
+    char const* specialName(int id) {
+        switch (id) {
+            case 10: return "gravedad normal";   case 11: return "gravedad invertida";
+            case 12: return "portal cubo";       case 13: return "portal nave";
+            case 45: return "espejo";            case 46: return "espejo normal";
+            case 47: return "portal bola";       case 99: return "tamano normal";
+            case 101: return "tamano mini";      case 111: return "portal ufo";
+            case 286: return "dual";             case 287: return "dual fin";
+            case 660: return "portal wave";      case 745: return "portal robot";
+            case 747: return "teletransporte";   case 1331: return "portal arana";
+            case 1933: return "portal swing";
+            case 200: return "velocidad 0.5x";   case 201: return "velocidad 1x";
+            case 202: return "velocidad 2x";     case 203: return "velocidad 3x";
+            case 1334: return "velocidad 4x";
+            case 31: return "start pos";
+            case 899: return "trigger color";    case 901: return "trigger move";
+            case 1006: return "trigger pulse";   case 1007: return "trigger alpha";
+            case 1049: return "trigger toggle";  case 1268: return "trigger spawn";
+            case 1346: return "trigger rotate";  case 1616: return "trigger stop";
+            default: return nullptr;
+        }
+    }
+
+    ai::Response toolGetLevelSummary() {
+        auto editor = LevelEditorLayer::get();
+        if (!editor) return fail("not_in_editor", "Abre un nivel en el editor primero", 409);
+        int count = static_cast<int>(editor->m_objects->count());
+        float minX = 0, maxX = 0, minY = 0, maxY = 0;
+        bool first = true;
+        std::unordered_map<int, int> byId;
+        std::set<int> groups;
+        auto special = matjson::Value::array();
+        struct Special { float x, y; int id; int uid; };
+        std::vector<Special> specials;
+        for (auto obj : CCArrayExt<GameObject*>(editor->m_objects)) {
+            float x = obj->getPositionX(), y = obj->getPositionY();
+            if (first) { minX = maxX = x; minY = maxY = y; first = false; }
+            minX = std::min(minX, x); maxX = std::max(maxX, x);
+            minY = std::min(minY, y); maxY = std::max(maxY, y);
+            byId[obj->m_objectID]++;
+            if (obj->m_groups) {
+                for (int i = 0; i < obj->m_groupCount && i < 10; i++) {
+                    int g = (*obj->m_groups)[i];
+                    if (g > 0) groups.insert(g);
+                }
+            }
+            if (specialName(obj->m_objectID)) specials.push_back({x, y, obj->m_objectID, obj->m_uniqueID});
+        }
+        std::sort(specials.begin(), specials.end(), [](auto const& a, auto const& b) { return a.x < b.x; });
+        for (size_t i = 0; i < specials.size() && i < 300; i++) {
+            special.push(matjson::makeObject({
+                {"x", specials[i].x}, {"y", specials[i].y}, {"id", specials[i].id},
+                {"uid", specials[i].uid}, {"name", specialName(specials[i].id)},
+            }));
+        }
+        std::vector<std::pair<int, int>> ids(byId.begin(), byId.end());
+        std::sort(ids.begin(), ids.end(), [](auto const& a, auto const& b) { return a.second > b.second; });
+        auto topIds = matjson::Value::array();
+        for (size_t i = 0; i < ids.size() && i < 40; i++) {
+            topIds.push(matjson::makeObject({{"id", ids[i].first}, {"count", ids[i].second}}));
+        }
+        auto usedGroups = matjson::Value::array();
+        int n = 0;
+        for (int g : groups) { if (n++ >= 300) break; usedGroups.push(g); }
+        int nextFree = 1;
+        while (groups.count(nextFree)) nextFree++;
+
+        std::string name = editor->m_level ? std::string(editor->m_level->m_levelName.c_str()) : "";
+        return reply(matjson::makeObject({
+            {"ok", true},
+            {"levelName", name},
+            {"objectCount", count},
+            {"bounds", matjson::makeObject({{"minX", minX}, {"maxX", maxX}, {"minY", minY}, {"maxY", maxY}})},
+            {"lengthBlocks", first ? 0 : static_cast<int>(maxX / 30)},
+            {"objectsById", topIds},
+            {"portalsAndTriggers", special},
+            {"portalsAndTriggersTotal", static_cast<int>(specials.size())},
+            {"usedGroups", usedGroups},
+            {"nextFreeGroup", nextFree},
+            {"historyBatches", static_cast<int>(historyFor(editor).size())},
+        }));
+    }
+
+    // ---------------- guardar ----------------
+
+    std::string safeFileName(std::string const& name) {
+        std::string out;
+        for (char c : name) out += (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_') ? c : '_';
+        if (out.empty()) out = "nivel";
+        return out.substr(0, 40);
+    }
+
+    ai::Response toolSaveLevel(matjson::Value const& body) {
+        auto editor = LevelEditorLayer::get();
+        if (!editor || !editor->m_level) return fail("not_in_editor", "Abre un nivel en el editor primero", 409);
+        std::string name = editor->m_level->m_levelName.c_str();
+        if (!body["confirm"].asBool().unwrapOr(false)) {
+            return fail("confirmation_required",
+                fmt::format("Guardar sobrescribe el nivel '{}' ({} objetos). Pide permiso al usuario y repite con confirm=true.",
+                    name, editor->m_objects->count()), 409);
+        }
+
+        // Copia recuperable de la version guardada anterior
+        std::string previous = editor->m_level->m_levelString.c_str();
+        auto dir = Mod::get()->getSaveDir() / "ai-backups";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        char stamp[32];
+        std::time_t now = std::time(nullptr);
+        std::tm tm{};
+#ifdef _WIN32
+        localtime_s(&tm, &now);
+#else
+        localtime_r(&now, &tm);
+#endif
+        std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
+        auto backup = dir / fmt::format("{}_{}.txt", safeFileName(name), stamp);
+        {
+            std::ofstream file(backup, std::ios::binary | std::ios::trunc);
+            file << previous;
+            if (!file) return fail("backup_failed", "No se pudo escribir la copia de seguridad; no se ha guardado nada", 500);
+        }
+
+        // Lo mismo que el boton "Save" del menu de pausa del editor
+        auto pause = EditorPauseLayer::create(editor);
+        if (!pause) return fail("save_failed", "No se pudo preparar el guardado", 500);
+        pause->saveLevel();
+
+        std::string after = editor->m_level->m_levelString.c_str();
+        log::info("[AI] Nivel '{}' guardado ({} -> {} bytes), copia en {}", name, previous.size(), after.size(), backup.string());
+        return reply(matjson::makeObject({
+            {"ok", !after.empty()},
+            {"levelName", name},
+            {"objectCount", static_cast<int>(editor->m_objects->count())},
+            {"savedBytes", static_cast<int>(after.size())},
+            {"changed", after != previous},
+            {"backupFile", backup.string()},
         }));
     }
 
@@ -694,6 +1005,10 @@ namespace {
             res = onMainThread(toolUndoLastBatch);
         } else if (tool == "get_objects_in_area") {
             res = onMainThread([params] { return toolGetObjectsInArea(params); });
+        } else if (tool == "get_level_summary") {
+            res = onMainThread(toolGetLevelSummary);
+        } else if (tool == "save_level") {
+            res = onMainThread([params] { return toolSaveLevel(params); });
         } else if (tool == "get_object_catalog") {
             res = onMainThread([params] { return toolGetObjectCatalog(params); });
         } else {
