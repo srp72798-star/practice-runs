@@ -869,7 +869,11 @@ class $modify(PRPlayLayer, PlayLayer) {
             this->syncMusic();
         }
 
-        if (g_run.state == RunState::Running && this->getCurrentPercent() >= g_run.end) {
+        // Un tramo que acaba en el 100% se corta justo antes del final: si el
+        // nivel llega a completarse sale "Practice Complete" y el menu de
+        // Repetir / Jugar normal se quedaba bloqueado debajo.
+        float endPct = std::min(g_run.end, 99.5f);
+        if (g_run.state == RunState::Running && this->getCurrentPercent() >= endPct) {
             showEndPrompt();
         }
     }
@@ -893,6 +897,11 @@ class $modify(PRPlayLayer, PlayLayer) {
 
     void levelComplete() {
         saveTrack(trackKey(this));
+        // Durante un tramo no se completa el nivel: se muestra nuestro menu
+        if (g_run.state == RunState::Running || g_run.state == RunState::EndPrompt) {
+            if (g_run.state == RunState::Running) showEndPrompt();
+            return;
+        }
         PlayLayer::levelComplete();
     }
 
